@@ -1,0 +1,7 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+# datasets fetched by examples/get_mnist.sh
+data/
+# build outputs
+build/

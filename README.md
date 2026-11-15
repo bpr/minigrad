@@ -1,0 +1,118 @@
+# minigrad
+
+A tensor library with automatic differentiation in
+[Mojo](https://docs.modular.com/mojo/), modeled on
+[tinygrad](https://github.com/tinygrad/tinygrad).
+
+minigrad keeps tinygrad's way of thinking (a small tensor API, lazy
+evaluation, a graph you can inspect, gradients as graph
+transformations, fusion into few kernels) and rebuilds what is
+underneath in one compiled language: the graph is an arena of
+hash-consed nodes, movement operations are strided views, and kernels
+run on a block interpreter and a tuned matrix-multiply kernel instead of
+generated code. It is a new implementation with compatibility goals, not
+a translation.
+
+```mojo
+from minigrad import Tensor
+from minigrad.nn import Adam, Linear, collect
+
+
+def main() raises:
+    # Lazy: nothing is computed until a value is read.
+    var x = Tensor.rand(4, 3).requires_grad_()
+    var loss = (x @ Tensor.ones(3, 2)).relu().sum()
+    loss.backward()
+    print(x.grad().to_string())
+
+    # A two-layer network learning XOR.
+    var inputs: List[List[Float64]] = [[0, 0], [0, 1], [1, 0], [1, 1]]
+    var targets: List[Float64] = [0, 1, 1, 0]
+    var xs = Tensor(inputs)
+    var ys = Tensor(targets).reshape(4, 1)
+    var l1 = Linear(2, 8)
+    var l2 = Linear(8, 1)
+    var opt = Adam(collect(l1, l2), lr=0.05)
+    for step in range(300):
+        opt.zero_grad()
+        var err = ((l2(l1(xs).tanh()).sigmoid() - ys) ** 2).mean()
+        err.backward()
+        opt.step([err])
+    print(l2(l1(xs).tanh()).sigmoid().to_string())
+```
+
+## Status
+
+Early. What works, on CPU:
+
+- **Tensors**: creation, arithmetic with broadcasting and type promotion,
+  comparisons, `where`, reductions, reshape/permute/expand/pad/shrink/
+  flip, `cat`/`stack`, matmul, convolution (stride, dilation, groups,
+  padding), pooling, softmax, cross-entropy, layer and batch
+  normalization; eleven element types.
+- **Gradients** of all of the above, including second derivatives.
+- **`minigrad.nn`**: `Linear`, `Conv2d`, `BatchNorm`, `LayerNorm`; `SGD`,
+  `Adam`, `AdamW`.
+- **MNIST**: `examples/mnist.mojo` trains tinygrad's `beautiful_mnist`
+  model to 97.9% test accuracy in 70 steps and 14 seconds.
+
+What does not exist yet: a GPU backend, Python bindings, indexing with
+slices and index tensors, embeddings, and everything a transformer
+needs beyond matmul. `docs/plan.md` has the order of work.
+
+Measured against tinygrad's CPU backend on one machine, a training step
+is 5 to 22 times faster than under `TinyJit` and 30 to 100 times faster
+than without it; `benchmarks/README.md` has the tables, how to
+reproduce them, and what they do not show.
+
+## Getting started
+
+minigrad needs [pixi](https://pixi.sh) and Linux on x86-64.
+
+```sh
+pixi install
+pixi run test                                  # 88 tests, about half a minute
+
+bash examples/get_mnist.sh                     # 55 MB into data/mnist/
+pixi run mojo run -I . examples/mnist.mojo     # 70 steps, batch 512
+```
+
+Programs import the package from the source tree with `-I .`. Set
+`MINIGRAD_DEBUG=2` to print every kernel as it runs:
+
+```
+gemm   15366.671 us  float32 [512, 1, 32, 24, 24, 32, 5, 5] reduce [5, 6, 7]  loads 2 instrs 3 loops []
+blocks 8719.815 us  float32 [512, 32, 20, 20]  loads 8 instrs 29 loops [512, 32, 400]
+```
+
+## How it differs from tinygrad to use
+
+The API follows tinygrad's names. The differences that come up first:
+
+- Shapes, types, and gradients are calls: `t.shape()`, `t.dtype()`,
+  `t.grad()`.
+- Comparisons are methods (`a.lt(b)`), and tuples become variadic
+  integers (`t.reshape(2, 3)`, `t.sum(0, 1)`).
+- Tensor code lives in `raises` functions.
+- `assign` and `+=` point the tensor at a new value; no buffer is ever
+  overwritten.
+- Call `backward()` before reading the loss, and pass the loss to the
+  optimizer so it is computed with the update: `opt.step([loss])`.
+
+`docs/differences-from-tinygrad.md` is the full list.
+
+## Documentation
+
+| | |
+|---|---|
+| `docs/architecture.md` | How a computation becomes loops, and why it is built this way |
+| `docs/differences-from-tinygrad.md` | Every deliberate deviation |
+| `docs/plan.md` | What is next; what was tried and dropped |
+| `benchmarks/README.md` | Numbers and how to reproduce them |
+| `AGENTS.md` | Layout, conventions, and Mojo traps, for people and coding assistants |
+
+## License
+
+Not chosen yet. tinygrad, whose API and several algorithms this follows
+(the view algebra and the gradient rules in particular), is MIT
+licensed.
