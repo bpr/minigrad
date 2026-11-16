@@ -27,6 +27,7 @@ from std.os import getenv
 from std.memory import unsafe_memset_zero
 from std.memory.alloc import unsafe_alloc
 from std.sys import num_physical_cores, simd_width_of, size_of
+from std.sys.intrinsics import PrefetchOptions, prefetch
 
 from minigrad.graph import BytePtr
 from minigrad.runtime.pool import run_parallel
@@ -42,6 +43,16 @@ comptime MC = 96
 comptime NC_VECTORS = 256
 """SIMD vectors of C columns per packed B block: with `KC` terms, about
 4 MB of packed B per thread."""
+
+comptime PREFETCH_ROWS = 32
+"""Rows ahead `_micro_direct` prefetches B. Its walk down a column strip
+of B, a few lines per row, defeats the hardware prefetcher when B is in
+memory rather than cache."""
+
+comptime DIRECT_PANELS = 2
+"""Row panels up to which a job reads B in place instead of packing it.
+Packing pays for itself by reusing a packed panel for many row panels;
+for a few rows (a batch of decode steps) it only adds a pass over B."""
 
 comptime PARALLEL_WORK = 2_000_000
 """Multiply-adds below which `gemm` stays on the calling thread (about
@@ -107,6 +118,46 @@ comptime _IntPtr = Pointer[Int, MutUntrackedOrigin]
 
 
 @always_inline
+def _micro_direct[
+    dt: DType, bdt: DType
+](
+    a: Pointer[Scalar[dt], MutUntrackedOrigin],
+    rows: _IntPtr,
+    b: Pointer[Scalar[bdt], MutUntrackedOrigin],
+    bk: _IntPtr,
+    kc: Int,
+    tile: Pointer[Scalar[dt], MutUntrackedOrigin],
+):
+    """`_micro_rows` reading B in place as well: row `k` of the tile's B
+    is the `NV * W` consecutive elements at `b + bk[k]`, converted from
+    `bdt` as they are loaded."""
+    comptime W = simd_width_of[dt]()
+    var acc = Array[SIMD[dt, W], MR * NV](fill=SIMD[dt, W](0))
+    var ptrs = Array[Pointer[Scalar[dt], MutUntrackedOrigin], MR](fill=a)
+    comptime for r in range(MR):
+        ptrs[r] = a.unsafe_offset(rows[unsafe_offset=r])
+    # The lines of the panel's row PREFETCH_ROWS ahead.
+    comptime LINES = (NV * W * size_of[Scalar[bdt]]() + 63) // 64
+    comptime STEP = 64 // size_of[Scalar[bdt]]()
+    for k in range(kc):
+        var pb = b.unsafe_offset(bk[unsafe_offset=k])
+        if k + PREFETCH_ROWS < kc:
+            var ahead = b.unsafe_offset(bk[unsafe_offset=k + PREFETCH_ROWS])
+            comptime for l in range(LINES):
+                prefetch[PrefetchOptions().for_read().high_locality()](
+                    ahead.unsafe_offset(l * STEP)
+                )
+        comptime for v in range(NV):
+            var bv = pb.unsafe_load[width=W, alignment=1](v * W).cast[dt]()
+            comptime for r in range(MR):
+                acc[r * NV + v] = SIMD[dt, W](ptrs[r][unsafe_offset=k]).fma(
+                    bv, acc[r * NV + v]
+                )
+    comptime for i in range(MR * NV):
+        tile.unsafe_store(i * W, acc[i])
+
+
+@always_inline
 def _is_unit(offsets: _IntPtr, n: Int) -> Bool:
     """Whether the `n` offsets are consecutive."""
     for i in range(1, n):
@@ -137,6 +188,105 @@ struct _Job(Copyable):
     var j_hi: Int
 
 
+comptime DOT_COLS = 3
+"""Columns of B per tile of `_block_dots`: with `MR` rows, 24
+accumulators, which leaves registers for the operands."""
+
+
+@always_inline
+def _dot_tile[
+    dt: DType, bdt: DType, NJ: Int
+](
+    rows_a: Array[Pointer[Scalar[dt], MutUntrackedOrigin], MR],
+    cols_b: Array[Pointer[Scalar[bdt], MutUntrackedOrigin], NJ],
+    nk: Int,
+    out_tile: Pointer[Scalar[dt], MutUntrackedOrigin],
+):
+    """`out_tile[r * NJ + q] = sum_k rows_a[r][k] * cols_b[q][k]`: `MR`
+    by `NJ` dot products over `nk` consecutive terms, B converted from
+    `bdt` as it is loaded."""
+    comptime W = simd_width_of[dt]()
+    var acc = Array[SIMD[dt, W], MR * NJ](fill=SIMD[dt, W](0))
+    var k = 0
+    while k + W <= nk:
+        var bv = Array[SIMD[dt, W], NJ](fill=SIMD[dt, W](0))
+        comptime for q in range(NJ):
+            bv[q] = cols_b[q].unsafe_load[width=W, alignment=1](k).cast[dt]()
+        comptime for r in range(MR):
+            var av = rows_a[r].unsafe_load[width=W, alignment=1](k)
+            comptime for q in range(NJ):
+                acc[r * NJ + q] = av.fma(bv[q], acc[r * NJ + q])
+        k += W
+    comptime for r in range(MR):
+        comptime for q in range(NJ):
+            var t = acc[r * NJ + q].reduce_add()
+            for kk in range(k, nk):
+                t += (
+                    rows_a[r][unsafe_offset=kk]
+                    * cols_b[q][unsafe_offset=kk].cast[dt]()
+                )
+            out_tile[unsafe_offset=r * NJ + q] = t
+
+
+def _block_dots[dt: DType, bdt: DType](job: _Job):
+    """`_block` for a few rows when the terms are consecutive in both A
+    and B (B stored `(out, in)`, as in `x @ w.T`): tiles of dot products
+    vectorized along the terms, both operands read in place."""
+    comptime P = Pointer[Scalar[dt], MutUntrackedOrigin]
+    comptime PB = Pointer[Scalar[bdt], MutUntrackedOrigin]
+    var nk = job.nk
+    var c = P(unsafe_from_address=job.c)
+    var a = P(unsafe_from_address=job.a)
+    var b = PB(unsafe_from_address=job.b)
+    var ci = _IntPtr(unsafe_from_address=job.ci)
+    var cj = _IntPtr(unsafe_from_address=job.cj)
+    var ai = _IntPtr(unsafe_from_address=job.ai)
+    var bj = _IntPtr(unsafe_from_address=job.bj)
+    var ak0 = _IntPtr(unsafe_from_address=job.ak)[unsafe_offset=0]
+    var bk0 = _IntPtr(unsafe_from_address=job.bk)[unsafe_offset=0]
+    # Missing rows of a short tile read zeros.
+    var zeros = unsafe_alloc[Scalar[dt]](nk + 64, alignment=64)
+    unsafe_memset_zero(zeros, nk + 64)
+    var tile = unsafe_alloc[Scalar[dt]](MR * DOT_COLS + MR, alignment=64)
+    var i = job.i_lo
+    while i < job.i_hi:
+        var rows = min(MR, job.i_hi - i)
+        var ra = Array[P, MR](fill=zeros)
+        for r in range(rows):
+            ra[r] = a.unsafe_offset(ai[unsafe_offset=i + r] + ak0)
+        var j = job.j_lo
+        while j < job.j_hi:
+            var nj = min(DOT_COLS, job.j_hi - j)
+            if nj == DOT_COLS:
+                var cb = Array[PB, DOT_COLS](fill=b)
+                comptime for q in range(DOT_COLS):
+                    cb[q] = b.unsafe_offset(bk0 + bj[unsafe_offset=j + q])
+                _dot_tile[dt, bdt, DOT_COLS](ra, cb, nk, tile)
+            else:
+                # Leftover columns one at a time, through the scratch
+                # area after the tile.
+                var one = tile.unsafe_offset(MR * DOT_COLS)
+                for q in range(nj):
+                    var cb = Array[PB, 1](
+                        fill=b.unsafe_offset(bk0 + bj[unsafe_offset=j + q])
+                    )
+                    _dot_tile[dt, bdt, 1](ra, cb, nk, one)
+                    for r in range(MR):
+                        tile[unsafe_offset=r * DOT_COLS + q] = one[
+                            unsafe_offset=r
+                        ]
+            for r in range(rows):
+                var crow = c.unsafe_offset(ci[unsafe_offset=i + r])
+                for q in range(nj):
+                    crow[unsafe_offset=cj[unsafe_offset=j + q]] += tile[
+                        unsafe_offset=r * DOT_COLS + q
+                    ]
+            j += nj
+        i += rows
+    zeros.unsafe_free()
+    tile.unsafe_free()
+
+
 def _block[dt: DType, bdt: DType](job: _Job):
     """Adds the contraction into the job's rows and columns of C. B is
     stored as `bdt` and converted to `dt` as it is packed."""
@@ -146,6 +296,13 @@ def _block[dt: DType, bdt: DType](job: _Job):
     comptime P = Pointer[Scalar[dt], MutUntrackedOrigin]
     var ni = job.i_hi - job.i_lo
     var nk = job.nk
+    if (
+        (ni + MR - 1) // MR <= DIRECT_PANELS
+        and _is_unit(_IntPtr(unsafe_from_address=job.ak), nk)
+        and _is_unit(_IntPtr(unsafe_from_address=job.bk), nk)
+    ):
+        _block_dots[dt, bdt](job)
+        return
     var c = P(unsafe_from_address=job.c)
     var a = P(unsafe_from_address=job.a)
     var b = Pointer[Scalar[bdt], MutUntrackedOrigin](unsafe_from_address=job.b)
@@ -165,6 +322,11 @@ def _block[dt: DType, bdt: DType](job: _Job):
     var zeros = unsafe_alloc[Scalar[dt]](kc_max + 64, alignment=64)
     unsafe_memset_zero(zeros, kc_max + 64)
     var edge = unsafe_alloc[Int](MR, alignment=64)
+    # Few rows read in place (A's terms consecutive): B panels whose
+    # columns are consecutive are read in place too, not packed.
+    var direct = (ni + MR - 1) // MR <= DIRECT_PANELS and _is_unit(
+        _IntPtr(unsafe_from_address=job.ak), nk
+    )
     var jc = job.j_lo
     while jc < job.j_hi:
         var nc = min(NC, job.j_hi - jc)
@@ -180,7 +342,10 @@ def _block[dt: DType, bdt: DType](job: _Job):
                 var dst = bpack.unsafe_offset(p * kc * NR)
                 var j0 = jc + p * NR
                 var nr = min(NR, jc + nc - j0)
-                if nr == NR and _is_unit(bj.unsafe_offset(j0), NR):
+                var unit = nr == NR and _is_unit(bj.unsafe_offset(j0), NR)
+                if direct and unit:
+                    continue
+                if unit:
                     var first = bj[unsafe_offset=j0]
                     for k in range(kc):
                         var src = b.unsafe_offset(bk[unsafe_offset=k] + first)
@@ -233,9 +398,34 @@ def _block[dt: DType, bdt: DType](job: _Job):
                     var cj_unit = nr == NR and _is_unit(
                         cj.unsafe_offset(j0), NR
                     )
+                    var in_place = (
+                        direct
+                        and nr == NR
+                        and _is_unit(bj.unsafe_offset(j0), NR)
+                    )
                     for p in range(panels):
                         var rows = min(MR, mc - p * MR)
-                        if not ak_unit:
+                        if in_place:
+                            # Rows of A by offset from `zeros`, missing
+                            # rows reading zeros, as below.
+                            var base = (Int(a) - Int(zeros)) // size_of[
+                                Scalar[dt]
+                            ]()
+                            for r in range(MR):
+                                edge[unsafe_offset=r] = (
+                                    ai[unsafe_offset=ic + p * MR + r]
+                                    + ak0
+                                    + base
+                                ) if r < rows else 0
+                            _micro_direct[dt, bdt](
+                                zeros,
+                                edge,
+                                b.unsafe_offset(bj[unsafe_offset=j0]),
+                                bk,
+                                kc,
+                                tile,
+                            )
+                        elif not ak_unit:
                             _micro[dt](
                                 apack.unsafe_offset(p * kc * MR),
                                 bpanel,

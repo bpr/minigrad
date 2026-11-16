@@ -923,24 +923,30 @@ struct _Batch(Copyable):
 
 
 def _batch_task(ctx: Int, i: Int):
-    """Contraction `i` of a batch."""
+    """Contraction `i` of a batch, on one thread."""
     var job = Pointer[_Batch, MutUntrackedOrigin](unsafe_from_address=ctx)
-    var plan = Pointer[Plan, MutUntrackedOrigin](unsafe_from_address=job[].plan)
+    _contract(job[].plan, job[].c, job[].a, job[].b, i, job[].threads)
+
+
+def _contract(plan_addr: Int, c0: Int, a0: Int, b0: Int, i: Int, threads: Int):
+    """Contraction `i` of the plan at `plan_addr`, on buffers at `c0`,
+    `a0`, `b0`, using up to `threads` threads."""
+    var plan = Pointer[Plan, MutUntrackedOrigin](unsafe_from_address=plan_addr)
     var isz = plan[].dtype.itemsize()
-    var c = BytePtr(unsafe_from_address=job[].c + plan[].cb[i] * isz)
-    var a = BytePtr(unsafe_from_address=job[].a + plan[].ab[i] * isz)
+    var c = BytePtr(unsafe_from_address=c0 + plan[].cb[i] * isz)
+    var a = BytePtr(unsafe_from_address=a0 + plan[].ab[i] * isz)
     var bsz = plan[].gemm_bdt.itemsize()
-    var b = BytePtr(unsafe_from_address=job[].b + plan[].bb[i] * bsz)
+    var b = BytePtr(unsafe_from_address=b0 + plan[].bb[i] * bsz)
     if plan[].dtype == DT.float64:
-        _gemm[DType.float64, DType.float64](c, a, b, plan, job[].threads)
+        _gemm[DType.float64, DType.float64](c, a, b, plan, threads)
     elif plan[].gemm_bdt == DT.float16:
-        _gemm[DType.float32, DType.float16](c, a, b, plan, job[].threads)
+        _gemm[DType.float32, DType.float16](c, a, b, plan, threads)
     elif plan[].gemm_bdt == DT.bfloat16:
-        _gemm[DType.float32, DType.bfloat16](c, a, b, plan, job[].threads)
+        _gemm[DType.float32, DType.bfloat16](c, a, b, plan, threads)
     elif plan[].gemm_bdt == DT.int8:
-        _gemm[DType.float32, DType.int8](c, a, b, plan, job[].threads)
+        _gemm[DType.float32, DType.int8](c, a, b, plan, threads)
     else:
-        _gemm[DType.float32, DType.float32](c, a, b, plan, job[].threads)
+        _gemm[DType.float32, DType.float32](c, a, b, plan, threads)
 
 
 @always_inline
@@ -983,24 +989,24 @@ def run_plan(
     var rt = runtime()
     if plan.gemm:
         unsafe_memset_zero(out_ptr, plan.out_size * plan.dtype.itemsize())
-        var batch = _Batch(
-            Int(Pointer(to=plan)),
-            Int(out_ptr),
-            Int(ins[plan.gemm_a]),
-            Int(ins[plan.gemm_b]),
-            rt[].threads,
-        )
+        var p = Int(Pointer(to=plan))
+        var c = Int(out_ptr)
+        var a = Int(ins[plan.gemm_a])
+        var b = Int(ins[plan.gemm_b])
         var nb = len(plan.cb)
         var work = len(plan.ci) * len(plan.cj) * len(plan.ak)
         if nb > 1 and work < GEMM_SPLIT_WORK:
-            # Many small products: one per task, each on one thread.
-            batch.threads = 1
-            run_parallel[_batch_task](Int(Pointer(to=batch)), nb)
+            # Many small products: one per task, each on one thread. The
+            # tasks read the arguments through an address, so they live
+            # in a list kept alive past the call (a struct on the stack
+            # reached that way was seen with stale fields).
+            var batch = List[_Batch]()
+            batch.append(_Batch(p, c, a, b, 1))
+            run_parallel[_batch_task](Int(batch.unsafe_ptr()), nb)
+            _ = batch^
         else:
-            for b in range(nb):
-                _batch_task(Int(Pointer(to=batch)), b)
-        # Tasks read `batch` through an address: keep it alive until here.
-        _ = batch^
+            for i in range(nb):
+                _contract(p, c, a, b, i, rt[].threads)
         return
     rt[].reserve(plan.nslots)
     var scratch = rt[].scratch

@@ -26,23 +26,18 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
    weights cut decode time by half or more. What remains:
    - **Batched throughput.** `generate_batch` decodes up to `batch`
      sequences of different lengths in lockstep and gives each the
-     tokens it gets alone. Its throughput is not yet measured on a
-     quiet machine; in noisy runs the gain was well short of the
-     batch size. The matrix-vector path's arithmetic is the suspect: at
-     8 rows it managed about 0.3 multiply-adds per cycle per core (sums
-     kept in memory); a register-tiled rewrite measured no better and
-     was dropped, and the tiled kernel now takes 4 rows and up. Measure
-     first, then look at the tiled kernel's packing of B, which a step
-     repeats for every matrix.
-   - **Continuous batching performance.** `Batcher` works (requests
-     arriving at any time get the tokens they get alone) but is not
-     measured on a quiet machine; at a load average of 15 it was slower
-     than serving requests one at a time. Stepping every slot (one
-     `MiniJit` capture per 64-position block) and stepping only up to
-     the highest occupied slot measured the same within the noise; the
-     first was kept as the simpler. What remains, once numbers are
-     reliable: the batched throughput item above, which is the real
-     limit (a step of 8 costs about 8 steps of 1); and a slot layout
+     tokens it gets alone. A step of 8 costs 1.2 to 1.3 steps of 1 with
+     8 threads on a quiet machine (`benchmarks/README.md`). Attention
+     scales with the batch by nature (each sequence reads its own
+     cache); its many tiny products each pay `gemm`'s setup, which
+     could be trimmed.
+   - **Continuous batching performance.** `Batcher` serves 24 requests
+     2.5x (int8) to 4.2x (float32) faster than one at a time with 8
+     slots. Stepping every slot (one `MiniJit` capture per 64-position
+     block) and stepping only up to the highest occupied slot measured
+     the same within the noise; the first was kept as the simpler.
+     What remains: prompts are processed one at a time as they are
+     admitted (they could share a step); and a slot layout
      that does not reserve `max_context` rows per sequence (pages of
      the cache, as vLLM does) if memory, not time, becomes the limit.
    - **Better quantization.** Weights can be `float16`, `bfloat16`, or
@@ -93,13 +88,11 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
 
 ## Smaller items
 
-- **An open regression**: since the pool, the 512 x 784 x 512 forward
-  product of the MLP benchmark is bimodal (313 µs best, about 1 ms
-  median) where the same work in the other layout is a steady 430-490
-  µs, and the MLP step went from 1.26 to 1.83 ms. The standalone `gemm`
-  benchmark of that layout is a steady 270 µs, so the difference is in
-  how the engine calls it (buffers, timing between jobs), not the
-  kernel. The first training step also grew (27 to 59 ms at batch 64).
+- **The 512 / 512 MLP step** is 1.59 ms against 1.26 ms before the
+  thread pool. Part of the earlier regression was that the executor ran
+  every product on one thread (fixed); whether the rest is the pool or
+  the noise of that first measurement is not known. The first training
+  step also grew (27 to 59 ms at batch 64).
 - `gemm` allocates its packing buffers on every call (about 150 page
   faults each); keep them per pool thread.
 

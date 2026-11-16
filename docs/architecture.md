@@ -191,9 +191,24 @@ the end of the context frees its slot. There is no paging and no
 copying of caches: a slot is `max_context` rows whether used or not.
 
 The point of batching is that each step reads the weights once for all
-sequences. With few rows `gemm` streams the weights in its
-matrix-vector path; that path keeps each row's sums in memory and slows
-as rows are added, so from 4 rows the tiled kernel takes over.
+sequences, so a step of 8 should cost little more than a step of 1:
+with one row a product is limited by reading the weights, and the extra
+rows' arithmetic is spread over the cores. `gemm` has three paths for
+few rows:
+
+- up to 3 rows, the matrix-vector path streams B's rows once, with each
+  row's sums in memory;
+- 4 to 16 rows (two panels of the tiled kernel), with B stored
+  `(in, out)`, the tiled kernel reads B in place instead of packing it.
+  Packing pays for itself only when many row panels reuse a packed
+  panel; here it would add a pass over B, and for int8 weights a copy
+  four times their size. The in-place microkernel walks down a strip of
+  B's columns, a few lines per row, which the hardware prefetcher does
+  not follow from memory, so it prefetches 32 rows ahead;
+- 4 to 16 rows with B stored `(out, in)` (the output projection,
+  `x @ wte.T`), tiles of 8 rows by 3 columns of dot products,
+  vectorized along the terms. Packing that layout went element by
+  element and took 29 of a 45 ms step.
 
 ### Capture and replay
 

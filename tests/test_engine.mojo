@@ -199,6 +199,28 @@ def test_matrix_vector() raises:
     assert_true(graph()[].stats.gemm_kernels >= before + 15)
 
 
+def test_few_rows() raises:
+    """Up to two panels of rows (a batch of decode steps): B read in
+    place, by rows for an `(in, out)` B and as dot products for an
+    `(out, in)` B; partial panels, terms past a vector and a block of
+    256, columns past whole tiles, and threads."""
+    for n in [4, 5, 8, 9, 13, 16, 17]:
+        check_matmul(n, 37, 101)
+        check_matmul(n, 300, 70)
+    check_matmul(8, 768, 400)  # past the threading threshold
+    check_matmul(13, 260, 1000)
+    for dt in [DT.int8, DT.float16]:
+        for shape in [(8, 300, 1000), (11, 64, 70)]:
+            var x = _seq([shape[0], shape[1]])
+            var w = (
+                (_seq([shape[1], shape[2]]) * 4.0).round().cast(dt).realize()
+            )
+            var expect = (x @ w.float().contiguous()).tolist()
+            assert_close(x @ w, expect, 1e-3)
+            var wt = w.T().contiguous().realize()
+            assert_close(x @ wt.T(), expect, 1e-3)
+
+
 def test_batched_contraction_threads() raises:
     """Heads as a batch dimension, small and large per product."""
     for shape in [(12, 1, 64, 40), (12, 30, 64, 40), (4, 200, 64, 300)]:

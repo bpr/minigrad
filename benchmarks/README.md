@@ -116,26 +116,39 @@ The final losses with and without the JIT are identical. tinygrad's
 ### Batched generation
 
 `build/gpt2_bench batch B N IDS...` decodes `B` sequences of different
-lengths at once. Correctness is tested (each sequence gets the greedy
-tokens it gets alone); throughput is not yet measured on a quiet
-machine. The runs so far happened at load averages of 9 to 15 on 16
-hardware threads, which preempts the thread pool mid-product and
-penalizes larger batches most; in them, batch 16 gave 1.6 to 2.3 times
-the tokens per second of batch 1. To measure in quiet time:
+lengths at once; each sequence gets the greedy tokens it gets alone.
+One decode step for every sequence of a batch, median of 60 steps
+alternating the batch sizes in one process, 8 threads, load average
+below 1:
 
-```sh
-for b in 1 2 4 8 16; do build/gpt2_bench --dtype int8 batch $b 40 $IDS; done
-```
+| weights | batch 1 | batch 8 | batch 16 |
+|---|---:|---:|---:|
+| int8, step | 3.42 ms | 4.44 ms | 7.04 ms |
+| int8, tokens/s | 292 | 1,803 | 2,274 |
+| float32, step | 8.64 ms | 10.14 ms | 12.79 ms |
+| float32, tokens/s | 116 | 789 | 1,251 |
+
+A step of 8 costs 1.2 to 1.3 steps of 1: with one sequence a product is
+limited by reading the weights, and the other seven sequences'
+arithmetic is spread over the cores. Single-threaded the ratio is 3.0
+(int8) and 2.2 (float32). Attention grows with the batch by nature,
+since each sequence reads its own cache.
 
 ### Continuous batching
 
 `build/gpt2_bench serve S R IDS...` serves `R` requests (prompts of 3
 or more tokens, 16 to 63 new tokens each, all arriving at once) with a
 `Batcher` of `S` slots, then one at a time, and prints throughput and
-mean completion time for both. Not yet measured on a quiet machine: the
-one run so far, at a load average of 15, gave 129 tokens/s batched (8
-slots, 24 requests) against 148 one at a time, which says more about the
-load than about batching.
+mean completion time for both. 8 slots, 24 requests (948 tokens), load
+average about 2:
+
+| weights | `Batcher`, 8 slots | one at a time | gain |
+|---|---:|---:|---:|
+| int8 | 1,056 tokens/s | 421 tokens/s | 2.5x |
+| float32 | 480 tokens/s | 113 tokens/s | 4.2x |
+
+The gain is below the batch's 8x because each admission processes its
+prompt alone, and the batch drains as the longest requests finish.
 
 ### Lower-precision weights
 
@@ -182,20 +195,23 @@ reading the loss.
 
 | batch / hidden | minigrad | tinygrad, `TinyJit` | tinygrad, no JIT | vs JIT | vs no JIT |
 |---|---:|---:|---:|---:|---:|
-| 8 / 32 | 102 µs | 828 µs | 10,510 µs | 8.1x | 103x |
-| 64 / 128 | 175 µs | 1,324 µs | 11,242 µs | 7.6x | 64x |
-| 512 / 512 | 1,825 µs | 27,702 µs | 37,454 µs | 15x | 21x |
+| 8 / 32 | 76 µs | 828 µs | 10,510 µs | 11x | 138x |
+| 64 / 128 | 145 µs | 1,324 µs | 11,242 µs | 9.1x | 78x |
+| 512 / 512 | 1,585 µs | 27,702 µs | 37,454 µs | 17x | 24x |
 
-The 512 / 512 step was 1,262 µs before the thread pool replaced
-threads created per call; its forward matrix product is now bimodal
-(313 µs at best, 1,001 µs median, against 427 µs for the same work in
-the other layout). The cause is not found yet; see `docs/plan.md`.
+minigrad's column is from a quiet machine (load average below 1), after
+a fix that made the executor's products use their threads at all: from
+the thread pool's arrival until then, every product run through the
+executor got one thread (an argument passed through a stack struct by
+address read stale). With one thread the same steps take 226 µs and
+3,510 µs for the larger two sizes. tinygrad's columns are from an
+earlier, noisier session.
 
 The first row is almost all host work, and is the comparison the brief
 cares about for small and dynamic workloads. minigrad rebuilds the
 graph, differentiates it, and schedules it on every step; `TinyJit`
-replays a recorded schedule and does none of that. Where minigrad's 102
-µs go:
+replays a recorded schedule and does none of that. Where minigrad's
+step went, measured when it took 102 µs:
 
 | | µs per step |
 |---|---:|
@@ -273,8 +289,8 @@ GB/s on GPT-2's layers, the machine's memory bandwidth.
 |---|---|
 | Runs a meaningful subset correctly, with backward and optimizers | Yes for MLPs, convnets, and GPT-2 inference: 99 tests, gradients checked against finite differences, MNIST to 97.7-97.9%, GPT-2 matching tinygrad's output |
 | Usable from Python without writing Mojo | Not started |
-| At least 5x on transformer inference | 12x on GPT-2 decode, about 14x for a whole short request, against tinygrad on CPU; within 25% of the float32 memory-bandwidth floor. No GPU, batching, or larger models yet |
-| At least 2-3x on a training workload | 7.6x to 15x over tinygrad's JIT on CPU, on these two models |
-| At least 10x less graph, scheduling, and dispatch overhead | 103x against tinygrad without JIT at the smallest size; 8x against `TinyJit`, which skips that work. GPT-2 decode spends 1.2 ms per token on host work |
+| At least 5x on transformer inference | 12x on GPT-2 decode, about 14x for a whole short request, against tinygrad on CPU; within 25% of the float32 memory-bandwidth floor. Batches of 8 sequences decode at 1.2-1.3x the cost of one. No GPU or larger models yet |
+| At least 2-3x on a training workload | 9x to 17x over tinygrad's JIT on CPU, on these two models |
+| At least 10x less graph, scheduling, and dispatch overhead | 138x against tinygrad without JIT at the smallest size; 11x against `TinyJit`, which skips that work. GPT-2 decode spends 1.2 ms per token on host work |
 | Competitive kernels | `gemm` is near peak on one thread; matrix-vector products reach memory bandwidth; everything else is unmeasured against other libraries |
 | No hidden trade | Same models, float32, same batch sizes, on CPU. No PyTorch or MAX baselines yet |

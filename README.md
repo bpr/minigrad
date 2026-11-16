@@ -90,8 +90,10 @@ work.
 Measured against tinygrad's CPU backend on one machine, GPT-2 decodes
 at 10 ms per token with float32 weights against tinygrad's 122 ms (close
 to the floor that reading 497 MB of weights per token sets), 5.8 ms with
-16-bit weights, and 4.3 ms with int8; a training step is 7.6 to 15 times
-faster than under `TinyJit`. These are single runs on a busy machine.
+16-bit weights, and 4.3 ms with int8; a batch of 8 sequences decodes at
+1.2 to 1.3 times the cost of one. A training step is 9 to 17 times
+faster than under `TinyJit`. Most numbers are single runs on a busy
+machine.
 `benchmarks/README.md` has the tables, how to reproduce them, and what
 they do not show.
 

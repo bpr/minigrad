@@ -40,7 +40,7 @@ Run a program against the source tree with `-I .`:
 ```sh
 pixi run mojo run -I . examples/mnist.mojo
 pixi run mojo build -I . -o build/mlp benchmarks/mlp_step.mojo
-MINIGRAD_DEBUG=2 build/mlp   # print every kernel run, with its time
+MINIGRAD_DEBUG=2 build/mlp   # print every kernel run (and MiniJit replay step), with its time
 MINIGRAD_THREADS=1 build/mlp # cap the threads of the matmul kernel
 ```
 
@@ -209,7 +209,11 @@ Each of these cost a debugging session.
   last use of `jobs`, so the list may be freed (or, for a stack struct,
   its stores optimized away) before the tasks read it. Write
   `_ = jobs^` after the call. It cost a crash in release builds only
-  and silently wrong results (zeros) in another case.
+  and silently wrong results (zeros) in another case. Even with
+  `_ = x^`, a struct on the stack reached through `Int(Pointer(to=x))`
+  was read with a stale field: `run_plan` ran every product on one
+  thread from the pool's arrival until found. Keep such arguments in a `List` and pass
+  `Int(list.unsafe_ptr())`, or pass plain values directly.
 - **`mojo run` unmaps the program's code at exit.** Threads still
   running it then crash the process after `main` returns. The pool is
   registered with `_get_global`'s destroy hook, which stops and joins

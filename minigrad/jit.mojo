@@ -39,6 +39,7 @@ What a replay does, and so what the function may do:
 """
 
 from std.memory import unsafe_memcpy
+from std.time import perf_counter_ns
 
 from minigrad.dtype import DT
 from minigrad.graph import BytePtr, OP_BUFFER, graph
@@ -220,7 +221,9 @@ struct MiniJit(Movable):
                 )
             now[self.inputs[i]] = _buffer_of(inputs[i])
         var ins = List[BytePtr]()
+        var trace = rt[].debug >= 2
         for s in self.tape:
+            var t0 = perf_counter_ns() if trace else 0
             ins.clear()
             for b in s.ins:
                 ins.append(g[].buffers[now.get(b, b)].ptr)
@@ -234,6 +237,16 @@ struct MiniJit(Movable):
                 run_scatter(ins[0], ins[1], dst, s)
             else:
                 run_copy(ins[0], ins[1], dst, s)
+            if trace:
+                var us = Float64(perf_counter_ns() - t0) / 1e3
+                if s.kind == STEP_KERNEL and s.plan >= 0:
+                    ref plan = rt[].plans[s.plan]
+                    var kind = String("gemm  ") if plan.gemm else String(
+                        "blocks"
+                    )
+                    print(t"replay {kind} {us} us  loops {plan.sizes}")
+                else:
+                    print(t"replay step{s.kind} {us} us")
         for i in range(len(self.state_before)):
             _copy_buffer(self.state_after[i], self.state_before[i])
         var out = List[Tensor]()
