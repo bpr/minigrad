@@ -63,6 +63,12 @@ def read_element(dt: DT, p: BytePtr, i: Int) -> Float64:
     return 0.0
 
 
+def _read_all[dt: DType](p: BytePtr, n: Int, mut out: List[Float64]):
+    var q = p.unsafe_bitcast[Scalar[dt]]()
+    for i in range(n):
+        out.append(Float64(q[unsafe_offset=i]))
+
+
 def _write[dt: DType](p: BytePtr, i: Int, v: Float64):
     p.unsafe_bitcast[Scalar[dt]]()[unsafe_offset=i] = Scalar[dt](v)
 
@@ -386,10 +392,10 @@ struct Tensor(ImplicitlyCopyable, Writable):
         var u = self._contiguous_uop()
         var p = graph()[].buffer_ptr(u.id)
         var dt = u.dtype()
-        var n = u.size()
-        var out = List[Float64](capacity=n)
-        for i in range(n):
-            out.append(read_element(dt, p, i))
+        var out = List[Float64](capacity=u.size())
+        comptime for c in range(DT.COUNT):
+            if dt.code == c:
+                _read_all[mojo_dtype(c)](p, u.size(), out)
         return out^
 
     def item(self) raises -> Float64:

@@ -251,6 +251,8 @@ struct Stats(Copyable):
     """Calls to the scheduler."""
     var gemm_kernels: Int
     """Kernels run by the tuned matrix-multiply kernel."""
+    var schedule_hits: Int
+    """Calls to the scheduler answered from the schedule cache."""
     var ns_group: Int
     """Nanoseconds spent sorting the graph and choosing kernel roots."""
     var ns_build: Int
@@ -265,6 +267,7 @@ struct Stats(Copyable):
         self.kernels_compiled = 0
         self.schedules = 0
         self.gemm_kernels = 0
+        self.schedule_hits = 0
         self.ns_group = 0
         self.ns_build = 0
         self.ns_execute = 0

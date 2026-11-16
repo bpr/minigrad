@@ -680,11 +680,57 @@ def make_plan(k: Kernel) -> Plan:
     return plan^
 
 
+struct CachedKernel(Copyable):
+    """A kernel of a cached schedule, by position in the schedule's
+    topological order rather than by node."""
+
+    var plan: Int
+    """The plan, or -1 for a kernel with no elements."""
+    var root: Int
+    """The position of the node the kernel realizes."""
+    var inputs: List[Int]
+    """The position of the node each load reads."""
+    var nbytes: Int
+    """The size of the output."""
+    var instrs: List[Instr]
+    """The kernel's program (it supplies constants' values)."""
+    var label: String
+    """A description, for `MINIGRAD_DEBUG`."""
+
+    def __init__(
+        out self,
+        plan: Int,
+        root: Int,
+        var inputs: List[Int],
+        nbytes: Int,
+        var instrs: List[Instr],
+        var label: String,
+    ):
+        self.plan = plan
+        self.root = root
+        self.inputs = inputs^
+        self.nbytes = nbytes
+        self.instrs = instrs^
+        self.label = label^
+
+
+comptime SCHEDULE_CACHE_LIMIT = 1024
+"""Schedules kept before the cache is emptied and starts over."""
+
+
 struct Runtime(Movable):
-    """The plan cache and scratch memory of the CPU executor."""
+    """The plan cache, schedule cache, and scratch memory of the CPU
+    executor."""
 
     var plans: List[Plan]
     var index: Dict[NodeKey, Int]
+    var schedules: List[List[CachedKernel]]
+    """Schedules by the structure of the graph they were made for; see
+    `minigrad.schedule`."""
+    var schedule_index: Dict[NodeKey, Int]
+    var cache_schedules: Bool
+    """False when the environment variable `MINIGRAD_SCHEDULE_CACHE` is
+    0, to compare against scheduling every time."""
     var scratch: BytePtr
     """Block temporaries: `scratch_slots` of `SLOT_BYTES` each."""
     var scratch_slots: Int
@@ -699,6 +745,9 @@ struct Runtime(Movable):
     def __init__(out self):
         self.plans = List[Plan]()
         self.index = Dict[NodeKey, Int]()
+        self.schedules = List[List[CachedKernel]]()
+        self.schedule_index = Dict[NodeKey, Int]()
+        self.cache_schedules = getenv("MINIGRAD_SCHEDULE_CACHE") != "0"
         self.scratch_slots = 32
         self.scratch = unsafe_alloc[Byte](
             self.scratch_slots * SLOT_BYTES, alignment=64

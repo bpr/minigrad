@@ -126,9 +126,11 @@ struct Adam(Movable):
     var b2: Float64
     var eps: Float64
     var weight_decay: Float64
-    var b1_t: Float64
-    """`b1` to the power of the number of steps taken."""
-    var b2_t: Float64
+    var b1_t: Tensor
+    """`b1` to the power of the number of steps taken. A tensor, not a
+    number, as in tinygrad: every step then builds a graph of the same
+    structure, which the schedule cache recognizes."""
+    var b2_t: Tensor
     var m: List[Tensor]
     """The running mean of each parameter's gradient."""
     var v: List[Tensor]
@@ -162,8 +164,8 @@ struct Adam(Movable):
         self.b2 = b2
         self.eps = eps
         self.weight_decay = weight_decay
-        self.b1_t = 1.0
-        self.b2_t = 1.0
+        self.b1_t = Tensor.full([], 1.0).contiguous().realize()
+        self.b2_t = Tensor.full([], 1.0).contiguous().realize()
         self.m = List[Tensor]()
         self.v = List[Tensor]()
         for p in self.params:
@@ -183,9 +185,11 @@ struct Adam(Movable):
     def step(mut self, also: List[Tensor]) raises:
         """Updates the parameters and realizes them together with the
         tensors in `also` (the loss, typically)."""
-        self.b1_t *= self.b1
-        self.b2_t *= self.b2
+        _ = self.b1_t.assign(self.b1_t * self.b1)
+        _ = self.b2_t.assign(self.b2_t * self.b2)
         var out = also.copy()
+        out.append(self.b1_t)
+        out.append(self.b2_t)
         for b in self.buffers:
             out.append(b)
         for i in range(len(self.params)):
@@ -197,8 +201,8 @@ struct Adam(Movable):
             _ = self.v[i].assign(
                 self.v[i] * self.b2 + (g * g) * (1.0 - self.b2)
             )
-            var m_hat = self.m[i] * (1.0 / (1.0 - self.b1_t))
-            var v_hat = self.v[i] * (1.0 / (1.0 - self.b2_t))
+            var m_hat = self.m[i] / (1.0 - self.b1_t)
+            var v_hat = self.v[i] / (1.0 - self.b2_t)
             var up = m_hat / (v_hat.sqrt() + self.eps)
             if self.weight_decay != 0.0:
                 up = up + t.detach() * self.weight_decay

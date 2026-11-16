@@ -54,6 +54,9 @@ Early. What works, on CPU:
 - **Gradients** of all of the above, including second derivatives.
 - **`minigrad.nn`**: `Linear`, `Conv2d`, `BatchNorm`, `LayerNorm`; `SGD`,
   `Adam`, `AdamW`.
+- **`minigrad.linalg`**: `solve`, `det`, `inv`, `cholesky`, `eigh` on small
+  dense matrices (eager, in float64, not differentiable), shared with
+  MojoDEC.
 - **MNIST**: `examples/mnist.mojo` trains tinygrad's `beautiful_mnist`
   model to 97.9% test accuracy in 70 steps.
 - **GPT-2 inference**: `examples/gpt2.mojo` loads Hugging Face's
@@ -61,6 +64,9 @@ Early. What works, on CPU:
   key-value cache. Its greedy output matches tinygrad's token for token,
   its logits agree to 2e-4, and its tokenizer agrees with tiktoken.
 
+- **Schedule caching**: a graph of the same structure as one scheduled
+  before (each step of a training or decode loop) replays its recorded
+  kernels.
 - **Lower-precision weights**: GPT-2's matrices can be stored as
   `float16`, `bfloat16`, or `int8` (one scale per output) and are
   converted as the matrix-multiply kernel reads them. 16-bit weights
@@ -86,7 +92,7 @@ minigrad needs [pixi](https://pixi.sh) and Linux on x86-64.
 
 ```sh
 pixi install
-pixi run test                                  # 105 tests, about a minute
+pixi run test                                  # 114 tests, about a minute
 
 bash examples/get_mnist.sh                     # 55 MB into data/mnist/
 pixi run mojo run -I . examples/mnist.mojo     # 70 steps, batch 512
@@ -135,6 +141,8 @@ The API follows tinygrad's names. The differences that come up first:
 
 ## License
 
-Not chosen yet. tinygrad, whose API and several algorithms this follows
-(the view algebra and the gradient rules in particular), is MIT
-licensed.
+The MIT License (MIT); see [LICENSE](LICENSE).
+
+tinygrad, whose API and several algorithms minigrad follows (the view
+algebra and the gradient rules in particular), is under its own MIT
+license; see [NOTICE](NOTICE).

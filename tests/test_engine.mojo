@@ -253,6 +253,32 @@ def test_converted_operand() raises:
     assert_true(graph()[].stats.gemm_kernels >= before + 30)
 
 
+def test_schedule_cache() raises:
+    """A graph of a structure seen before replays its schedule, on its
+    own buffers; a different constant is a different structure."""
+    var hits = graph()[].stats.schedule_hits
+    for i in range(4):
+        var d = List[Float64]()
+        for j in range(300):
+            d.append(Float64((j * 7 + i) % 11) - 5.0)
+        var a = Tensor.from_list(d, [3, 100])
+        var b = Tensor.from_list(d, [100, 3])
+        var got = ((a * 2.0 + 1.0).relu() @ b).sum(1)
+        var expect = List[Float64]()
+        for r in range(3):
+            var s = 0.0
+            for c in range(3):
+                for k in range(100):
+                    var x = d[r * 100 + k] * 2.0 + 1.0
+                    s += (x if x > 0 else 0.0) * d[k * 3 + c]
+            expect.append(s)
+        assert_close(got, expect, 1e-3)
+    assert_equal(graph()[].stats.schedule_hits, hits + 3)
+    var a = Tensor.ones(3, 100)
+    _ = ((a * 3.0 + 1.0).relu() @ Tensor.ones(100, 3)).sum(1).realize()
+    assert_equal(graph()[].stats.schedule_hits, hits + 3)
+
+
 def test_matmul_float64_and_ints() raises:
     var a = _seq([9, 11], DT.float64)
     var b = _seq([11, 6], DT.float64)

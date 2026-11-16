@@ -28,6 +28,7 @@ from std.time import perf_counter_ns
 from minigrad.dtype import DT
 from minigrad.graph import (
     BytePtr,
+    NodeKey,
     graph,
     is_binary,
     is_movement,
@@ -55,8 +56,10 @@ from minigrad.runtime.kernel import (
     K_CONST,
     K_LOAD,
     Kernel,
+    CachedKernel,
     Load,
     Plan,
+    SCHEDULE_CACHE_LIMIT,
     make_plan,
     run_plan,
     runtime,
@@ -394,50 +397,113 @@ struct _Scheduler(Movable):
             self.kernels.append(k^)
         return True
 
-    def execute(mut self) raises:
+    def execute(mut self) raises -> Optional[List[CachedKernel]]:
         """Runs the kernels, in topological order, and turns their roots
-        into buffers."""
+        into buffers.
+
+        Returns:
+            The schedule to cache, or `None` if it cannot be replayed
+            (it made buffers for padded constants, which are not in the
+            graph).
+        """
         var g = graph()
         var rt = runtime()
+        var cacheable = len(self.keep) == 0
+        var cached = List[CachedKernel]()
+        var e = g[].epoch
         var ins = List[BytePtr]()
         for ki in range(len(self.kernels)):
             ref k = self.kernels[ki]
-            var out_buf = g[].alloc_buffer(k.out_size() * k.dtype.itemsize())
-            var out_ptr = g[].buffers[out_buf].ptr
-            ins.clear()
-            for l in k.loads:
-                if g[].nodes[l.node].op != OP_BUFFER:
-                    raise Error("internal: kernel input is not realized")
-                ins.append(g[].buffer_ptr(l.node))
+            var plan_id = -1
             if prod(k.shape) > 0:
                 var key = k.key()
-                var plan_id = rt[].index.get(key, -1)
+                plan_id = rt[].index.get(key, -1)
                 if plan_id < 0:
                     rt[].plans.append(make_plan(k))
                     plan_id = len(rt[].plans) - 1
                     rt[].index[key^] = plan_id
                     g[].stats.kernels_compiled += 1
-                var t0 = perf_counter_ns() if rt[].debug >= 2 else 0
-                run_plan(rt[].plans[plan_id], out_ptr, ins, k.instrs)
-                g[].stats.kernels_run += 1
-                if rt[].plans[plan_id].gemm:
-                    g[].stats.gemm_kernels += 1
-                if rt[].debug >= 2:
-                    _trace(k, rt[].plans[plan_id], Int(perf_counter_ns() - t0))
-            g[].become_buffer(k.root, out_buf)
+            var inputs = List[Int]()
+            for l in k.loads:
+                inputs.append(g[].pos[l.node] if g[].stamp[l.node] == e else -1)
+                if g[].stamp[l.node] != e:
+                    cacheable = False
+            var label = String("")
+            if rt[].debug >= 2:
+                var red = String("")
+                if k.reduce_op >= 0:
+                    red = String(t" reduce {k.reduce_axes}")
+                label = String(
+                    t"{k.dtype} {k.shape}{red}  loads {len(k.loads)} instrs"
+                    t" {len(k.instrs)}"
+                )
+            var ck = CachedKernel(
+                plan_id,
+                g[].pos[k.root],
+                inputs^,
+                k.out_size() * k.dtype.itemsize(),
+                k.instrs.copy(),
+                label^,
+            )
+            ins.clear()
+            for l in k.loads:
+                ins.append(g[].buffer_ptr(l.node))
+            _run(ck, k.root, ins)
+            cached.append(ck^)
         self.keep.clear()
+        if cacheable:
+            return cached^
+        return None
 
 
-def _trace(k: Kernel, plan: Plan, ns: Int):
-    """Prints one line about a kernel that just ran."""
-    var kind = String("gemm  ") if plan.gemm else String("blocks")
-    var red = String("")
-    if k.reduce_op >= 0:
-        red = String(t" reduce {k.reduce_axes}")
-    print(
-        t"{kind} {Float64(ns) / 1e3} us  {k.dtype} {k.shape}{red}  loads"
-        t" {len(k.loads)} instrs {len(k.instrs)} loops {plan.sizes}"
-    )
+def _run(ck: CachedKernel, root: Int, ins: List[BytePtr]) raises:
+    """Runs one kernel into a new buffer and makes `root` that buffer."""
+    var g = graph()
+    var rt = runtime()
+    var out_buf = g[].alloc_buffer(ck.nbytes)
+    if ck.plan >= 0:
+        var t0 = perf_counter_ns() if rt[].debug >= 2 else 0
+        ref plan = rt[].plans[ck.plan]
+        run_plan(plan, g[].buffers[out_buf].ptr, ins, ck.instrs)
+        g[].stats.kernels_run += 1
+        if plan.gemm:
+            g[].stats.gemm_kernels += 1
+        if rt[].debug >= 2:
+            var kind = String("gemm  ") if plan.gemm else String("blocks")
+            print(
+                t"{kind} {Float64(perf_counter_ns() - t0) / 1e3} us "
+                t" {ck.label}  loops {plan.sizes}"
+            )
+    g[].become_buffer(root, out_buf)
+
+
+def _signature(order: List[Int], roots: List[Int]) -> NodeKey:
+    """The structure of the graph `order` (a topological order) holds:
+    each node's operation, element type, shape, argument, and inputs by
+    position, without the identity of its buffers. Graphs with equal
+    signatures get the same schedule."""
+    var g = graph()
+    var d = List[Int](capacity=12 * len(order))
+    for n in order:
+        ref node = g[].nodes[n]
+        d.append(node.op)
+        d.append(node.dtype.code)
+        d.append(g[].pos[node.s0] if node.s0 >= 0 else -1)
+        d.append(g[].pos[node.s1] if node.s1 >= 0 else -1)
+        d.append(g[].pos[node.s2] if node.s2 >= 0 else -1)
+        d.append(len(node.shape))
+        for s in node.shape:
+            d.append(s)
+        if node.op == OP_BUFFER:
+            d.append(-1)  # which buffer does not matter
+        else:
+            d.append(len(node.arg))
+            for a in node.arg:
+                d.append(a)
+    d.append(-2)
+    for r in roots:
+        d.append(g[].pos[r])
+    return NodeKey(d^)
 
 
 def realize(roots: List[UOp]) raises:
@@ -455,18 +521,50 @@ def realize(roots: List[UOp]) raises:
     if len(ids) == 0:
         return
     g[].stats.schedules += 1
+    var rt = runtime()
+    var t0 = perf_counter_ns()
+    # A graph of a structure scheduled before replays that schedule:
+    # only which buffers it reads differs.
+    var key: Optional[NodeKey] = None
+    if rt[].cache_schedules:
+        var order = g[].toposort(ids)
+        var sig = _signature(order, ids)
+        var found = rt[].schedule_index.get(sig, -1)
+        if found >= 0:
+            var t1 = perf_counter_ns()
+            g[].stats.ns_group += Int(t1 - t0)
+            g[].stats.schedule_hits += 1
+            var ins = List[BytePtr]()
+            for i in range(len(rt[].schedules[found])):
+                ref ck = rt[].schedules[found][i]
+                ins.clear()
+                for p in ck.inputs:
+                    ins.append(g[].buffer_ptr(order[p]))
+                _run(ck, order[ck.root], ins)
+            g[].stats.ns_execute += Int(perf_counter_ns() - t1)
+            return
+        key = sig^
     var forced = List[Int]()
     while True:
         var s = _Scheduler()
-        var t0 = perf_counter_ns()
-        s.group(ids, forced)
         var t1 = perf_counter_ns()
-        var built = s.build()
+        s.group(ids, forced)
         var t2 = perf_counter_ns()
-        g[].stats.ns_group += Int(t1 - t0)
-        g[].stats.ns_build += Int(t2 - t1)
+        var built = s.build()
+        var t3 = perf_counter_ns()
+        g[].stats.ns_group += Int(t2 - t0)
+        g[].stats.ns_build += Int(t3 - t2)
         if built:
-            s.execute()
-            g[].stats.ns_execute += Int(perf_counter_ns() - t2)
+            var cached = s.execute()
+            g[].stats.ns_execute += Int(perf_counter_ns() - t3)
+            if cached and key:
+                if len(rt[].schedules) >= SCHEDULE_CACHE_LIMIT:
+                    rt[].schedules.clear()
+                    rt[].schedule_index.clear()
+                rt[].schedules.append(cached.value().copy())
+                rt[].schedule_index[key.value().copy()] = (
+                    len(rt[].schedules) - 1
+                )
             return
         forced.append(s.fail_node)
+        t0 = t1

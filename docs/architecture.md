@@ -149,6 +149,26 @@ become instructions. Movement nodes are pushed on a chain; at a buffer
 innermost first, to the buffer's identity view. The result is an SSA
 program whose leaves are `(buffer, view)` loads and constants.
 
+### Schedules are cached by structure
+
+A training loop or a decode loop builds a graph of the same structure
+every step: only which buffers sit at the leaves, and so what they hold,
+changes. Before scheduling, `realize` computes a signature of the graph:
+each node's operation, element type, shape, argument, and inputs, by
+position in the topological order, with buffers anonymous. A signature
+seen before replays the recorded kernels (each kept as a plan, its
+root's position, its inputs' positions, and its program) against the
+current graph's nodes, skipping root selection, kernel building, and
+plan lookups. The signature includes constants' values, so a step whose
+constants change (Adam's bias correction, if it were a number) misses;
+Adam keeps that correction in tensors for this reason, as tinygrad does.
+Set `MINIGRAD_SCHEDULE_CACHE=0` to schedule every time.
+
+What a hit still costs is building the graph: the user's code runs every
+step, creating about 2,500 nodes for a GPT-2 decode step (about 0.65 ms).
+Capturing a whole step and replaying it without running the code again,
+as `TinyJit` does, would remove that too; see `docs/plan.md`.
+
 ## Plans
 
 `make_plan` (`minigrad/runtime/kernel.mojo`) lowers a kernel to loops.
@@ -256,11 +276,12 @@ followed by an elementwise multiply. Scales that vary along the summed
 dimension (group-wise quantization, as llama.cpp uses for 4-bit
 weights) do not factor out and would need more than this.
 
-The cache's shapes grow with the context, so a decode step at a new
-length builds new plans for the attention kernels (about 8 per token,
-cheap, but the plan cache grows with every length seen). A fixed
-maximum length with a mask, as tinygrad uses, would fix the shapes; see
-`docs/plan.md`.
+A decode step attends to the cache's first rows rounded up to a
+multiple of 64, with a mask buffer (0 for rows written, -inf after) that
+`write_` keeps current. Within each block of 64 positions every step
+builds a graph of the same shapes, so the schedule cache replays it, and
+plans exist only per block. tinygrad masks the whole cache instead; here
+that read 72 MB of cache per token and cost more than scheduling saved.
 
 ## What to read first
 

@@ -89,6 +89,15 @@ path for long prompts is slow", not as a 165x better design. The
 brief's warning applies: a ratio over 100x means the baseline is on a
 slow path.
 
+### Schedule cache
+
+Decode steps of the same shapes replay a cached schedule (63 of every 64
+steps). In one run with int8 weights it saved about 0.3 ms per token
+(4.62 to 4.33 ms), and for float32 about the same (9.75 to 9.39 ms):
+kernel building, about 0.3 ms per step, disappears, and computing the
+graph's signature adds about 0.06 ms. A small MLP training step went
+from 103 to 78 µs. Compare with `MINIGRAD_SCHEDULE_CACHE=0`.
+
 ### Lower-precision weights
 
 The token embedding and every layer's matrices stored narrower (biases,

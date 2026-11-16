@@ -74,6 +74,7 @@ Tests import `tests/helpers.mojo`, so they need `-I tests` as well
 | `minigrad/nn/` | Layers (`Linear`, `Conv2d`, `BatchNorm`, `LayerNorm`) and optimizers (`SGD`, `Adam`, `AdamW`) |
 | `minigrad/datasets.mojo` | MNIST loader |
 | `minigrad/nn/__init__.mojo` (end) | `quantize_int8`: symmetric int8 with a scale per output |
+| `minigrad/linalg.mojo` | Eager dense linear algebra: `solve`, `det`, `inv`, `cholesky`, `eigh` (copied from MojoDEC) |
 | `minigrad/json.mojo`, `minigrad/safetensors.mojo` | A minimal JSON reader; reading safetensors weights |
 | `minigrad/llm/` | `bpe.mojo` (GPT-2's tokenizer), `gpt2.mojo` (the model, with a key-value cache) |
 | `tests/` | One `test_*.mojo` per area; `helpers.mojo` has `assert_close` |
@@ -160,6 +161,17 @@ Design points that span several files:
   promotion; int8 is `x.dot(q) * scale`. GPT-2's `Weight` struct wraps
   it. The test for exactness: stored natively must equal float32
   weights rounded the same way (`test_gpt2_perplexity`).
+- **Schedules are cached by the graph's structure** (`realize`,
+  `_signature`): a hit replays recorded kernels against the current
+  nodes. Keep step graphs structurally stable: values that change every
+  step belong in tensors (Adam's `b1_t`), not constants, and shapes in
+  decode change only every 64 positions (`DECODE_ROWS`).
+  `MINIGRAD_SCHEDULE_CACHE=0` turns the cache off for comparison.
+- **`minigrad/linalg.mojo` is a copy of MojoDEC's
+  `mojodec/routines/dense.mojo`** (pivoted LU, Cholesky, `tred2`/`tql2`
+  `eigh`), on flat lists instead of NuMojo arrays. Fix bugs in both. The
+  user chose copying over a shared library for now and will revisit if
+  duplication spreads across projects.
 - **Threads come from one pool** (`runtime/pool.mojo`), used by `gemm`
   and batched products. Jobs are split into several chunks per thread
   where that costs nothing, so one preempted thread holds up only a

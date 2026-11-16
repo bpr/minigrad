@@ -260,6 +260,32 @@ def test_gpt2_greedy() raises:
         assert_equal(model.generate(prompt, len(expect)), expect)
 
 
+def test_gpt2_decode_matches_prompt() raises:
+    """Decoding token by token (masked attention over 64-row blocks of
+    the cache, schedules replayed) gives the logits that processing the
+    whole sequence at once does, across a block boundary."""
+    if not exists("data/gpt2/model.safetensors"):
+        print("skipped: run examples/get_gpt2.sh for data/gpt2")
+        return
+    from minigrad.graph import graph
+    from minigrad.llm.gpt2 import GPT2
+
+    var model = GPT2("data/gpt2/model.safetensors", 128)
+    var ids = List[Int]()
+    for i in range(70):
+        ids.append((i * 7919) % 50000)
+    var head = List[Int]()
+    for i in range(58):
+        head.append(ids[i])
+    var hits = graph()[].stats.schedule_hits
+    var logits = model.forward(head, 0)
+    for p in range(58, 70):
+        logits = model.forward([ids[p]], p)
+    var whole = model.forward(ids, 0)
+    assert_close(logits, whole.tolist(), 2e-3)
+    assert_true(graph()[].stats.schedule_hits > hits + 8)
+
+
 def test_gpt2_perplexity() raises:
     """Lower-precision weights are exact as a mechanism and cheap in
     quality. Stored as 16-bit floats, the model computes what a float32

@@ -3,9 +3,14 @@
 The model of tinygrad's `examples/gpt2.py`, loading Hugging Face's
 safetensors weights. Each layer keeps a key-value cache: one
 `(max_context, n_embd)` tensor each for keys and values, which `write_`
-fills row by row, so a step processes only the new tokens. A step over
-`T` new tokens at position `p` attends to the cache's first `p + T` rows;
-shapes vary with `p`, and plans are built once per length.
+fills row by row, so a step processes only the new tokens. A prompt of
+`T > 1` tokens at position `p` attends to the cache's first `p + T`
+rows. A single token attends to the cache's first `p + 1` rows rounded up
+to a multiple of `DECODE_ROWS`, through a mask that hides the rows not
+yet written (tinygrad masks the whole cache). Decode steps then build
+graphs of the same shapes for `DECODE_ROWS` steps at a time, which the
+schedule cache replays without scheduling them again, while reading
+little more of the cache than they need.
 
 The large matrices can be stored in `float16`, `bfloat16`, or `int8`
 (with a scale per output); everything is computed in `float32`. `gemm`
@@ -14,6 +19,7 @@ memory traffic and nothing else.
 """
 
 from std.math import exp
+from std.utils.numerics import inf
 
 from minigrad.dtype import DT
 from minigrad.nn import quantize_int8
@@ -31,6 +37,10 @@ struct GPT2Config(Copyable, Writable):
     var vocab_size: Int
     var n_ctx: Int
     """The longest sequence the position embedding covers."""
+
+
+comptime DECODE_ROWS = 64
+"""Decode attends to a multiple of this many cache rows."""
 
 
 struct Weight(Copyable):
@@ -106,13 +116,17 @@ struct Block(Copyable):
         self.fc_b = w.pop(prefix + "mlp.c_fc.bias")
         self.fc_proj_w = Weight(w.pop(prefix + "mlp.c_proj.weight"), dtype, 1)
         self.fc_proj_b = w.pop(prefix + "mlp.c_proj.bias")
-        self.k_cache = Tensor.empty([max_context, n_embd])
-        self.v_cache = Tensor.empty([max_context, n_embd])
+        # Zeros: rows not yet written are masked, and must not be NaN.
+        self.k_cache = Tensor.zeros(max_context, n_embd).contiguous().realize()
+        self.v_cache = Tensor.zeros(max_context, n_embd).contiguous().realize()
 
-    def __call__(self, x: Tensor, start_pos: Int, n_head: Int) raises -> Tensor:
+    def __call__(
+        self, x: Tensor, start_pos: Int, n_head: Int, mask: Tensor
+    ) raises -> Tensor:
         """The layer applied to `x`, `(T, n_embd)`: the tokens at
         positions `start_pos ...`. Writes their keys and values into the
-        cache."""
+        cache. `mask` is 0 for the cache's written rows and -inf for the
+        rest."""
         var t = x.shape()[0]
         var c = x.shape()[1]
         var hd = c // n_head
@@ -120,15 +134,25 @@ struct Block(Copyable):
         qkv = self.attn_w(qkv) + self.attn_b
         self.k_cache.write_(0, start_pos, qkv.slice(1, c, 2 * c))
         self.v_cache.write_(0, start_pos, qkv.slice(1, 2 * c, 3 * c))
-        var l = start_pos + t
         var q = qkv.slice(1, 0, c).reshape(t, n_head, hd).permute(1, 0, 2)
-        var k = (
-            self.k_cache.slice(0, 0, l).reshape(l, n_head, hd).permute(1, 0, 2)
-        )
-        var v = (
-            self.v_cache.slice(0, 0, l).reshape(l, n_head, hd).permute(1, 0, 2)
-        )
-        var a = q.scaled_dot_product_attention(k, v, None, is_causal=t > 1)
+        var a: Tensor
+        if t == 1:
+            var n = min(
+                (start_pos // DECODE_ROWS + 1) * DECODE_ROWS,
+                self.k_cache.shape()[0],
+            )
+            var k = self.k_cache.slice(0, 0, n).reshape(n, n_head, hd)
+            var v = self.v_cache.slice(0, 0, n).reshape(n, n_head, hd)
+            a = q.scaled_dot_product_attention(
+                k.permute(1, 0, 2), v.permute(1, 0, 2), mask.slice(0, 0, n)
+            )
+        else:
+            var l = start_pos + t
+            var k = self.k_cache.slice(0, 0, l).reshape(l, n_head, hd)
+            var v = self.v_cache.slice(0, 0, l).reshape(l, n_head, hd)
+            a = q.scaled_dot_product_attention(
+                k.permute(1, 0, 2), v.permute(1, 0, 2), None, is_causal=True
+            )
         a = a.permute(1, 0, 2).reshape(t, c)
         var h = x + (self.proj_w(a) + self.proj_b)
         var m = h.layernorm(-1, 1e-5) * self.ln2_w + self.ln2_b
@@ -148,6 +172,8 @@ struct GPT2(Movable):
     var lnf_w: Tensor
     var lnf_b: Tensor
     var max_context: Int
+    var mask: Tensor
+    """`(max_context,)`: 0 at the positions the caches hold, -inf after."""
 
     def __init__(
         out self,
@@ -206,6 +232,7 @@ struct GPT2(Movable):
             )
         self.lnf_w = w.pop("ln_f.weight")
         self.lnf_b = w.pop("ln_f.bias")
+        self.mask = Tensor.empty([self.max_context])
 
     def forward(
         self, tokens: List[Int], start_pos: Int, all_positions: Bool = False
@@ -233,9 +260,17 @@ struct GPT2(Movable):
         var x = self.wte.w.take_rows(tokens).float()
         if self.wte.scale:
             x = x * self.wte.scale.value().take_rows(tokens)
-        x = x + self.wpe.slice(0, start_pos, start_pos + t)
+        var positions = List[Int]()
+        for i in range(start_pos, start_pos + t):
+            positions.append(i)
+        x = x + self.wpe.take_rows(positions)
+        if start_pos == 0:
+            self.mask.write_(
+                0, 0, Tensor.full([self.max_context], -inf[DType.float64]())
+            )
+        self.mask.write_(0, start_pos, Tensor.zeros(t))
         for i in range(len(self.blocks)):
-            x = self.blocks[i](x, start_pos, self.config.n_head)
+            x = self.blocks[i](x, start_pos, self.config.n_head, self.mask)
         if not all_positions:
             x = x.slice(0, t - 1, t)
         x = x.layernorm(-1, 1e-5) * self.lnf_w + self.lnf_b

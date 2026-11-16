@@ -20,6 +20,9 @@ introduced.
   must own its buffer.
 - **`take_rows(ids)` is an eager, host-side embedding lookup** with a
   list of ints; tinygrad's `Embedding` is lazy and differentiable.
+- **GPT-2 decode attends to the cache rounded up to 64 rows**, masked;
+  tinygrad's example masks the whole `MAX_CONTEXT` cache and uses
+  symbolic shapes. Both keep shapes fixed across steps for replay.
 - **`scaled_dot_product_attention`'s `is_causal`** aligns the mask at the
   end (query `i` sees keys up to `L - T + i`), so it is right for a
   decoder with a cache; tinygrad's aligns it at the start.
@@ -87,6 +90,10 @@ introduced.
   16-bit floats is done in their own type, element by element, as in
   tinygrad; their sums accumulate in `float32` and are converted back,
   as in tinygrad. The fp8 types are absent.
+- **`minigrad.linalg`** (`solve`, `det`, `inv`, `cholesky`, `eigh`) has no
+  counterpart in tinygrad, whose `Tensor` has `qr` and `svd` built from
+  tensor operations. These are eager host routines in float64, not
+  lazy or differentiable.
 - **Quantization** is `nn.quantize_int8` (symmetric, per output) and a
   multiply after the product; tinygrad's GGUF loader instead
   dequantizes block formats in its graph.
