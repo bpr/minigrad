@@ -166,8 +166,31 @@ Set `MINIGRAD_SCHEDULE_CACHE=0` to schedule every time.
 
 What a hit still costs is building the graph: the user's code runs every
 step, creating about 2,500 nodes for a GPT-2 decode step (about 0.65 ms).
-Capturing a whole step and replaying it without running the code again,
-as `TinyJit` does, would remove that too; see `docs/plan.md`.
+
+### Capture and replay
+
+`TinyJit` (`minigrad/jit.mojo`) removes that too, as tinygrad's does: it
+runs a step function once, runs it again while the runtime records a
+tape of everything that touches memory, and from then on replays the
+tape without running the function. The tape has three kinds of step: a
+kernel (plan, program, input and output buffers), a gather
+(`take_rows`), and a copy (`write_`). The function's input tensors are
+substituted by buffer; everything else it read is read from the same
+buffers again, which the capture holds (`Buffer.held`) so they are not
+recycled.
+
+Two things differ from tinygrad because buffers here are immutable.
+State such as weights and optimizer moments is updated by `assign`,
+which in minigrad points the tensor at a new buffer; a replay would go on
+reading the old one. So `assign` records, during a capture, each
+tensor's buffer before the step, and every replay copies the new value
+back into it at the end (tinygrad's `assign` writes in place, so it
+needs no copy). And values that change every call must be tensors: the
+eager operations take their indices from tensors (`take_rows(rows:
+Tensor)`, `write_(dim, start: Tensor, ...)`), and their host-integer
+forms raise during a capture rather than baking a stale value into the
+tape. GPT-2's `decode` keeps one `TinyJit` per block of 64 positions,
+since attention's shapes change at each block.
 
 ## Plans
 

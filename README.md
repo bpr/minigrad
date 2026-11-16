@@ -64,9 +64,10 @@ Early. What works, on CPU:
   key-value cache. Its greedy output matches tinygrad's token for token,
   its logits agree to 2e-4, and its tokenizer agrees with tiktoken.
 
-- **Schedule caching**: a graph of the same structure as one scheduled
-  before (each step of a training or decode loop) replays its recorded
-  kernels.
+- **Schedule caching and `TinyJit`**: a graph of the same structure as
+  one scheduled before replays its recorded kernels; `TinyJit` goes
+  further and replays a whole step without running its code (a small
+  training step: 78 to 21 µs). GPT-2's `decode` uses it.
 - **Lower-precision weights**: GPT-2's matrices can be stored as
   `float16`, `bfloat16`, or `int8` (one scale per output) and are
   converted as the matrix-multiply kernel reads them. 16-bit weights
@@ -92,7 +93,7 @@ minigrad needs [pixi](https://pixi.sh) and Linux on x86-64.
 
 ```sh
 pixi install
-pixi run test                                  # 114 tests, about a minute
+pixi run test                                  # 120 tests, about a minute
 
 bash examples/get_mnist.sh                     # 55 MB into data/mnist/
 pixi run mojo run -I . examples/mnist.mojo     # 70 steps, batch 512

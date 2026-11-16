@@ -14,6 +14,13 @@ introduced.
   there is no way to update part of a buffer. Reason: nodes are
   hash-consed, so tensors with equal values share buffers.
 - **`+=`, `-=`, `*=`** rebind the tensor the same way.
+- **`TinyJit`** is called as `jit(f, inputs)` with a list of tensors,
+  not as a decorator. A replay copies each tensor assigned in the step
+  back into its old buffer, where tinygrad's in-place `assign` needs no
+  copy. Host values are fixed at capture as in tinygrad, but `take_rows`
+  and `write_` with host integers raise during a capture instead of
+  replaying stale indices; tinygrad uses symbolic `Variable`s for
+  changing positions, minigrad tensors of indices.
 - **`write_(dim, start, value)` is the one in-place write**, eager and
   outside the graph, for key-value caches; tinygrad writes caches with
   `assign` into a slice (`cache[:, start:end].assign(x)`). The tensor

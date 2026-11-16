@@ -57,7 +57,9 @@ from minigrad.runtime.kernel import (
     K_LOAD,
     Kernel,
     CachedKernel,
+    JitStep,
     Load,
+    STEP_KERNEL,
     Plan,
     SCHEDULE_CACHE_LIMIT,
     make_plan,
@@ -411,7 +413,7 @@ struct _Scheduler(Movable):
         var cacheable = len(self.keep) == 0
         var cached = List[CachedKernel]()
         var e = g[].epoch
-        var ins = List[BytePtr]()
+        var ins = List[Int]()
         for ki in range(len(self.kernels)):
             ref k = self.kernels[ki]
             var plan_id = -1
@@ -447,7 +449,7 @@ struct _Scheduler(Movable):
             )
             ins.clear()
             for l in k.loads:
-                ins.append(g[].buffer_ptr(l.node))
+                ins.append(g[].nodes[l.node].arg[0])
             _run(ck, k.root, ins)
             cached.append(ck^)
         self.keep.clear()
@@ -456,14 +458,27 @@ struct _Scheduler(Movable):
         return None
 
 
-def _run(ck: CachedKernel, root: Int, ins: List[BytePtr]) raises:
-    """Runs one kernel into a new buffer and makes `root` that buffer."""
+def _run(ck: CachedKernel, root: Int, in_bufs: List[Int]) raises:
+    """Runs one kernel, reading buffers `in_bufs`, into a new buffer, and
+    makes `root` that buffer. A `TinyJit` capture records it."""
     var g = graph()
     var rt = runtime()
     var out_buf = g[].alloc_buffer(ck.nbytes)
+    if rt[].recording:
+        for b in in_bufs:
+            g[].hold(b)
+        g[].hold(out_buf)
+        rt[].tape.append(
+            JitStep(
+                STEP_KERNEL, ck.plan, ck.instrs.copy(), in_bufs.copy(), out_buf
+            )
+        )
     if ck.plan >= 0:
         var t0 = perf_counter_ns() if rt[].debug >= 2 else 0
         ref plan = rt[].plans[ck.plan]
+        var ins = List[BytePtr](capacity=len(in_bufs))
+        for b in in_bufs:
+            ins.append(g[].buffers[b].ptr)
         run_plan(plan, g[].buffers[out_buf].ptr, ins, ck.instrs)
         g[].stats.kernels_run += 1
         if plan.gemm:
@@ -534,12 +549,12 @@ def realize(roots: List[UOp]) raises:
             var t1 = perf_counter_ns()
             g[].stats.ns_group += Int(t1 - t0)
             g[].stats.schedule_hits += 1
-            var ins = List[BytePtr]()
+            var ins = List[Int]()
             for i in range(len(rt[].schedules[found])):
                 ref ck = rt[].schedules[found][i]
                 ins.clear()
                 for p in ck.inputs:
-                    ins.append(g[].buffer_ptr(order[p]))
+                    ins.append(g[].nodes[order[p]].arg[0])
                 _run(ck, order[ck.root], ins)
             g[].stats.ns_execute += Int(perf_counter_ns() - t1)
             return

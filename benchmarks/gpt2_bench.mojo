@@ -109,7 +109,7 @@ def main() raises:
                 graph()[].stats.ns_execute = 0
                 total = 0
             var s = perf_counter_ns()
-            logits = model.forward([tok], pos)
+            logits = model.decode(tok, pos)
             tok = sample(logits.tolist(), 0.0, 0)
             var dt = Int(perf_counter_ns() - s)
             times.append(dt)

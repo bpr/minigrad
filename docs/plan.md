@@ -44,14 +44,16 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
      executor); `take_rows` is eager and host-side today.
    - Slicing with steps and `__getitem__` with ranges; `cumsum`;
      `multinomial`.
-2. **Cut host work per step further.** Schedules are now cached by the
-   graph's structure (a small MLP step: 103 to 78 µs). What a step
-   still pays is running the user's code to build the graph: about
-   2,500 nodes and 0.65 ms for a GPT-2 decode step, 15% of it with int8
-   weights. Two routes: make node creation cheaper (each allocates its
-   shape, argument, and hash-cons key as lists), or capture a whole step
-   and replay it without running the code (tinygrad's `TinyJit`), which
-   needs a way to name a step's inputs and outputs.
+2. **Host work per step** is mostly gone where it matters: schedules
+   are cached by structure, and `TinyJit` replays whole steps (a small
+   MLP training step 78 to 21 µs; GPT-2 decode saves about 0.9 ms per
+   token in the one clean measurement so far, to be confirmed in quiet
+   time). Left: steps that cannot be captured (host values that change,
+   shapes that change), whose graphs could still be built more cheaply
+   (each node allocates its shape, argument, and hash-cons key as
+   lists). Replays copy assigned state back into place every step; for a
+   large model that copy would want in-place writes into state buffers
+   during replay instead.
 3. **Fuse elementwise work after a reduction** (`sum * c`, `matmul +
    bias`, `relu` of a convolution) into the reduction's kernel. For
    `gemm` kernels: apply the tail to each tile, or run it as a second

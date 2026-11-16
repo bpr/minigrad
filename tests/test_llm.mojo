@@ -262,8 +262,9 @@ def test_gpt2_greedy() raises:
 
 def test_gpt2_decode_matches_prompt() raises:
     """Decoding token by token (masked attention over 64-row blocks of
-    the cache, schedules replayed) gives the logits that processing the
-    whole sequence at once does, across a block boundary."""
+    the cache, schedules replayed, and through TinyJit) gives the logits
+    that processing the whole sequence at once does, across a block
+    boundary."""
     if not exists("data/gpt2/model.safetensors"):
         print("skipped: run examples/get_gpt2.sh for data/gpt2")
         return
@@ -284,6 +285,11 @@ def test_gpt2_decode_matches_prompt() raises:
     var whole = model.forward(ids, 0)
     assert_close(logits, whole.tolist(), 2e-3)
     assert_true(graph()[].stats.schedule_hits > hits + 8)
+    # The same through TinyJit: steps 3 onward in each block replay.
+    _ = model.forward(head, 0)
+    for p in range(58, 70):
+        logits = model.decode(ids[p], p)
+    assert_close(logits, whole.tolist(), 2e-3)
 
 
 def test_gpt2_perplexity() raises:

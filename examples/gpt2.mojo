@@ -73,7 +73,7 @@ def main() raises:
         out.append(next)
         if k + 1 < count:
             var s = perf_counter_ns()
-            logits = model.forward([next], pos)
+            logits = model.decode(next, pos)
             steps.append(Int(perf_counter_ns() - s))
             pos += 1
     print(tok.decode(out))

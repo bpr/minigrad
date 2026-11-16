@@ -98,6 +98,21 @@ kernel building, about 0.3 ms per step, disappears, and computing the
 graph's signature adds about 0.06 ms. A small MLP training step went
 from 103 to 78 µs. Compare with `MINIGRAD_SCHEDULE_CACHE=0`.
 
+### TinyJit
+
+A replay runs the recorded kernels without building, scheduling, or
+planning a graph. On a busy machine (load average 2 to 3), so treat the
+decode figure as provisional:
+
+| | plain | `TinyJit` |
+|---|---:|---:|
+| MLP training step, batch 8, hidden 32 | 78 µs | 21 µs |
+| MLP training step, batch 64, hidden 128 | 169 µs | 120 µs |
+| GPT-2 decode, int8 weights (cleanest round of three) | 4.28 ms | 3.40 ms |
+
+The final losses with and without the JIT are identical. tinygrad's
+`TinyJit` takes 828 µs for the first MLP row.
+
 ### Lower-precision weights
 
 The token embedding and every layer's matrices stored narrower (biases,

@@ -20,7 +20,7 @@ dimension (see `minigrad.runtime.blockops`).
 """
 
 from std.ffi import _Global
-from std.memory import unsafe_memset_zero
+from std.memory import unsafe_memcpy, unsafe_memset_zero
 from std.memory.alloc import unsafe_alloc
 from std.os import abort, getenv
 
@@ -714,6 +714,97 @@ struct CachedKernel(Copyable):
         self.label = label^
 
 
+comptime STEP_KERNEL = 0
+comptime STEP_GATHER = 1
+comptime STEP_COPY = 2
+
+
+struct JitStep(Copyable):
+    """One thing a `TinyJit` capture does, by buffer id: run a kernel,
+    gather rows (`take_rows`), or copy rows in place (`write_`)."""
+
+    var kind: Int
+    var plan: Int
+    """`STEP_KERNEL`: the plan, or -1 for a kernel with no elements."""
+    var instrs: List[Instr]
+    var ins: List[Int]
+    """Buffers read: a kernel's loads; `[table, index]` for a gather;
+    `[source, start]` for a copy."""
+    var out: Int
+    """The buffer written."""
+    var index_dt: DT
+    """The type of the index (gather) or start (copy) buffer."""
+    var n: Int
+    """Rows gathered, or indices copied."""
+    var row: Int
+    """Bytes per row (gather), or per index of the copied dimension
+    (copy)."""
+    var limit: Int
+    """Rows in the table (gather), or the size of the copied dimension
+    (copy)."""
+    var outer: Int
+    """For a copy, the product of the dimensions before it."""
+
+    def __init__(
+        out self,
+        kind: Int,
+        plan: Int,
+        var instrs: List[Instr],
+        var ins: List[Int],
+        dst: Int,
+    ):
+        self.kind = kind
+        self.plan = plan
+        self.instrs = instrs^
+        self.ins = ins^
+        self.out = dst
+        self.index_dt = DT.int32
+        self.n = 0
+        self.row = 0
+        self.limit = 0
+        self.outer = 0
+
+
+def read_index(p: BytePtr, dt: DT, i: Int) raises -> Int:
+    """Element `i` of an integer index buffer."""
+    if dt == DT.int32:
+        return Int(p.unsafe_bitcast[Int32]()[unsafe_offset=i])
+    if dt == DT.int64:
+        return Int(p.unsafe_bitcast[Int64]()[unsafe_offset=i])
+    raise Error(t"index of type {dt}: use int32 or int64")
+
+
+def run_gather(table: BytePtr, index: BytePtr, dst: BytePtr, s: JitStep) raises:
+    """Copies rows `index[0..n]` of `table` to `dst`."""
+    for i in range(s.n):
+        var r = read_index(index, s.index_dt, i)
+        if r < 0 or r >= s.limit:
+            raise Error(
+                t"take_rows(): index {r} out of range for {s.limit} rows"
+            )
+        unsafe_memcpy(
+            dest=dst.unsafe_offset(i * s.row),
+            src=table.unsafe_offset(r * s.row),
+            count=s.row,
+        )
+
+
+def run_copy(src: BytePtr, start: BytePtr, dst: BytePtr, s: JitStep) raises:
+    """Writes `src` over indices `[start, start + n)` of the copied
+    dimension of `dst`."""
+    var at = read_index(start, s.index_dt, 0)
+    if at < 0 or at + s.n > s.limit:
+        raise Error(
+            t"write_() of {s.n} indices at {at} into a dimension of {s.limit}"
+        )
+    for o in range(s.outer):
+        unsafe_memcpy(
+            dest=dst.unsafe_offset((o * s.limit + at) * s.row),
+            src=src.unsafe_offset(o * s.n * s.row),
+            count=s.n * s.row,
+        )
+
+
 comptime SCHEDULE_CACHE_LIMIT = 1024
 """Schedules kept before the cache is emptied and starts over."""
 
@@ -731,6 +822,10 @@ struct Runtime(Movable):
     var cache_schedules: Bool
     """False when the environment variable `MINIGRAD_SCHEDULE_CACHE` is
     0, to compare against scheduling every time."""
+    var recording: Bool
+    """Whether a `TinyJit` is capturing: kernels and eager operations
+    are appended to `tape`, and their buffers held."""
+    var tape: List[JitStep]
     var scratch: BytePtr
     """Block temporaries: `scratch_slots` of `SLOT_BYTES` each."""
     var scratch_slots: Int
@@ -748,6 +843,8 @@ struct Runtime(Movable):
         self.schedules = List[List[CachedKernel]]()
         self.schedule_index = Dict[NodeKey, Int]()
         self.cache_schedules = getenv("MINIGRAD_SCHEDULE_CACHE") != "0"
+        self.recording = False
+        self.tape = List[JitStep]()
         self.scratch_slots = 32
         self.scratch = unsafe_alloc[Byte](
             self.scratch_slots * SLOT_BYTES, alignment=64

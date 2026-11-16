@@ -278,6 +278,13 @@ struct UOp(Equatable, ImplicitlyCopyable):
         g[].buffers[b].rc += 1
         return UOp._make0(OP_BUFFER, dt, shape.copy(), [b])
 
+    @staticmethod
+    def on_buffer(buffer: Int, dt: DT, shape: List[Int]) -> UOp:
+        """A `BUFFER` node for the existing buffer `buffer`, sharing its
+        memory."""
+        graph()[].buffers[buffer].rc += 1
+        return UOp._make0(OP_BUFFER, dt, shape.copy(), [buffer])
+
     # ---- movement
 
     def reshape(self, new_shape: List[Int]) raises -> UOp:

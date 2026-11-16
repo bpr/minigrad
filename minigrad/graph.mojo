@@ -215,12 +215,16 @@ struct Buffer(Movable):
     var nbytes: Int
     """The size in bytes (0 for a free slot)."""
     var rc: Int
-    """The number of `BUFFER` nodes that share this memory."""
+    """References: `BUFFER` nodes that share this memory, plus holds."""
+    var held: Int
+    """References from `TinyJit` captures, which replay into the buffer
+    (counted in `rc` too)."""
 
     def __init__(out self, ptr: BytePtr, nbytes: Int):
         self.ptr = ptr
         self.nbytes = nbytes
         self.rc = 0
+        self.held = 0
 
 
 struct GradSlot(Movable):
@@ -533,6 +537,7 @@ struct Graph(Movable):
             self.buffers[id].ptr = ptr
             self.buffers[id].nbytes = size
             self.buffers[id].rc = 0
+            self.buffers[id].held = 0
             return id
         self.buffers.append(Buffer(ptr, size))
         return len(self.buffers) - 1
@@ -557,6 +562,16 @@ struct Graph(Movable):
             self.pool[size].append(ptr)
         except:
             ptr.unsafe_free()
+
+    def hold(mut self, id: Int):
+        """Keeps buffer `id` alive for a capture."""
+        self.buffers[id].rc += 1
+        self.buffers[id].held += 1
+
+    def unhold(mut self, id: Int):
+        """Drops a capture's hold on buffer `id`."""
+        self.buffers[id].held -= 1
+        self.release_buffer(id)
 
     def buffer_ptr(self, node: Int) -> BytePtr:
         """The memory of `BUFFER` node `node`."""

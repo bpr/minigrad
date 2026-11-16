@@ -22,6 +22,7 @@ from std.math import exp
 from std.utils.numerics import inf
 
 from minigrad.dtype import DT
+from minigrad.jit import TinyJit
 from minigrad.nn import quantize_int8
 from minigrad.safetensors import safe_load
 from minigrad.tensor import Tensor, _next_uniform
@@ -121,19 +122,25 @@ struct Block(Copyable):
         self.v_cache = Tensor.zeros(max_context, n_embd).contiguous().realize()
 
     def __call__(
-        self, x: Tensor, start_pos: Int, n_head: Int, mask: Tensor
+        self,
+        x: Tensor,
+        start_pos: Int,
+        start: Tensor,
+        n_head: Int,
+        mask: Tensor,
     ) raises -> Tensor:
         """The layer applied to `x`, `(T, n_embd)`: the tokens at
         positions `start_pos ...`. Writes their keys and values into the
-        cache. `mask` is 0 for the cache's written rows and -inf for the
-        rest."""
+        cache at `start`, which holds `start_pos` (a tensor, so that a
+        `TinyJit` replays the write at new positions). `mask` is 0 for
+        the cache's written rows and -inf for the rest."""
         var t = x.shape()[0]
         var c = x.shape()[1]
         var hd = c // n_head
         var qkv = x.layernorm(-1, 1e-5) * self.ln1_w + self.ln1_b
         qkv = self.attn_w(qkv) + self.attn_b
-        self.k_cache.write_(0, start_pos, qkv.slice(1, c, 2 * c))
-        self.v_cache.write_(0, start_pos, qkv.slice(1, 2 * c, 3 * c))
+        self.k_cache.write_(0, start, qkv.slice(1, c, 2 * c))
+        self.v_cache.write_(0, start, qkv.slice(1, 2 * c, 3 * c))
         var q = qkv.slice(1, 0, c).reshape(t, n_head, hd).permute(1, 0, 2)
         var a: Tensor
         if t == 1:
@@ -174,6 +181,8 @@ struct GPT2(Movable):
     var max_context: Int
     var mask: Tensor
     """`(max_context,)`: 0 at the positions the caches hold, -inf after."""
+    var jits: Dict[Int, TinyJit]
+    """Captured decode steps, one per block of `DECODE_ROWS` positions."""
 
     def __init__(
         out self,
@@ -233,6 +242,7 @@ struct GPT2(Movable):
         self.lnf_w = w.pop("ln_f.weight")
         self.lnf_b = w.pop("ln_f.bias")
         self.mask = Tensor.empty([self.max_context])
+        self.jits = Dict[Int, TinyJit]()
 
     def forward(
         self, tokens: List[Int], start_pos: Int, all_positions: Bool = False
@@ -257,20 +267,59 @@ struct GPT2(Movable):
                 t"GPT2: position {start_pos + t} is past the context of"
                 t" {self.max_context}"
             )
-        var x = self.wte.w.take_rows(tokens).float()
-        if self.wte.scale:
-            x = x * self.wte.scale.value().take_rows(tokens)
         var positions = List[Int]()
         for i in range(start_pos, start_pos + t):
             positions.append(i)
-        x = x + self.wpe.take_rows(positions)
         if start_pos == 0:
             self.mask.write_(
                 0, 0, Tensor.full([self.max_context], -inf[DType.float64]())
             )
-        self.mask.write_(0, start_pos, Tensor.zeros(t))
+        return self._run(
+            Tensor(tokens), Tensor(positions), start_pos, all_positions
+        )
+
+    def decode(mut self, token: Int, pos: Int) raises -> Tensor:
+        """`forward([token], pos)`, through a `TinyJit`: after two steps
+        in each block of `DECODE_ROWS` positions, a step replays the
+        recorded kernels without building or scheduling a graph.
+
+        Returns:
+            The `(vocab_size,)` logits, in a buffer the next `decode`
+            overwrites: read them first.
+        """
+        if pos < 1 or pos >= self.max_context:
+            raise Error(t"GPT2.decode: position {pos} out of range")
+        var key = pos // DECODE_ROWS
+        var jit = self.jits.pop(key, TinyJit())
+
+        def step(xs: List[Tensor]) raises {ref self, var pos} -> List[Tensor]:
+            return [self._run(xs[0], xs[1], pos, False)]
+
+        var out = jit(step, [Tensor([token]), Tensor([pos])])
+        self.jits[key] = jit^
+        return out[0]
+
+    def _run(
+        self,
+        tokens: Tensor,
+        positions: Tensor,
+        start_pos: Int,
+        all_positions: Bool,
+    ) raises -> Tensor:
+        """The forward pass, with the tokens and their positions as
+        `int32` tensors; `start_pos` (the first position) only sets
+        shapes."""
+        var t = tokens.shape()[0]
+        var x = self.wte.w.take_rows(tokens).float()
+        if self.wte.scale:
+            x = x * self.wte.scale.value().take_rows(tokens)
+        x = x + self.wpe.take_rows(positions)
+        var start = positions.slice(0, 0, 1)
+        self.mask.write_(0, start, Tensor.zeros(t))
         for i in range(len(self.blocks)):
-            x = self.blocks[i](x, start_pos, self.config.n_head, self.mask)
+            x = self.blocks[i](
+                x, start_pos, start, self.config.n_head, self.mask
+            )
         if not all_positions:
             x = x.slice(0, t - 1, t)
         x = x.layernorm(-1, 1e-5) * self.lnf_w + self.lnf_b
@@ -298,7 +347,7 @@ struct GPT2(Movable):
         return exp(nll.item())
 
     def generate(
-        self,
+        mut self,
         prompt: List[Int],
         count: Int,
         temperature: Float64 = 0.0,
@@ -326,7 +375,7 @@ struct GPT2(Movable):
             var next = sample(logits.tolist(), temperature, top_k)
             out.append(next)
             if i + 1 < count:
-                logits = self.forward([next], pos)
+                logits = self.decode(next, pos)
                 pos += 1
         return out^
 

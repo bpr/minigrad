@@ -74,6 +74,7 @@ Tests import `tests/helpers.mojo`, so they need `-I tests` as well
 | `minigrad/nn/` | Layers (`Linear`, `Conv2d`, `BatchNorm`, `LayerNorm`) and optimizers (`SGD`, `Adam`, `AdamW`) |
 | `minigrad/datasets.mojo` | MNIST loader |
 | `minigrad/nn/__init__.mojo` (end) | `quantize_int8`: symmetric int8 with a scale per output |
+| `minigrad/jit.mojo` | `TinyJit`: capture a step function's kernels and eager operations, then replay them |
 | `minigrad/linalg.mojo` | Eager dense linear algebra: `solve`, `det`, `inv`, `cholesky`, `eigh` (copied from MojoDEC) |
 | `minigrad/json.mojo`, `minigrad/safetensors.mojo` | A minimal JSON reader; reading safetensors weights |
 | `minigrad/llm/` | `bpe.mojo` (GPT-2's tokenizer), `gpt2.mojo` (the model, with a key-value cache) |
@@ -172,6 +173,13 @@ Design points that span several files:
   `eigh`), on flat lists instead of NuMojo arrays. Fix bugs in both. The
   user chose copying over a shared library for now and will revisit if
   duplication spreads across projects.
+- **`TinyJit` replays a tape** recorded in `runtime().tape` while
+  `recording` is set: kernels (from `schedule._run`), gathers, and copies
+  (`_record` in `tensor.mojo`), by buffer id. Captured buffers are held
+  (`Graph.hold`; `write_`'s ownership check subtracts holds). `assign`
+  records state during a capture (`jit_state()`), copied back after each
+  replay. Anything new that touches memory outside a kernel must record
+  itself, or replays silently skip it.
 - **Threads come from one pool** (`runtime/pool.mojo`), used by `gemm`
   and batched products. Jobs are split into several chunks per thread
   where that costs nothing, so one preempted thread holds up only a
@@ -187,6 +195,10 @@ Each of these cost a debugging session.
   anything that creates nodes (`UOp._make1(..., a)` exists for this).
   The same rule makes "at the end of the test, nothing leaked" checks
   see zero live nodes: sample inside the loop.
+- **`x.id` is not a use of `x` either.** In `f(g.buffer_ptr(a.id),
+  g.buffer_ptr(b.id))` the handle `a` can be destroyed (freeing its node)
+  right after `a.id` is read; `write_` crashed this way. End such code
+  with `_ = a^` to keep the handle to that point.
 - **An address passed as an `Int` does not keep its value alive.** In
   `run_parallel[t](Int(jobs.unsafe_ptr()), n)` the conversion is the
   last use of `jobs`, so the list may be freed (or, for a stack struct,

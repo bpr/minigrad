@@ -1,6 +1,6 @@
 """Time per training step of a two-layer MLP on random data.
 
-    mojo run -I . benchmarks/mlp_step.mojo [BATCH] [HIDDEN] [STEPS]
+    mojo run -I . benchmarks/mlp_step.mojo [BATCH] [HIDDEN] [STEPS] [jit]
 
 Prints the median step time: forward, cross-entropy, backward, and an
 SGD update with momentum, including reading the loss. The matching
@@ -11,6 +11,7 @@ from std.sys import argv
 from std.time import perf_counter_ns
 
 from minigrad.graph import graph
+from minigrad.jit import TinyJit
 from minigrad.nn import Linear, SGD, collect
 from minigrad.tensor import Tensor
 
@@ -26,6 +27,16 @@ def main() raises:
     var l1 = Linear(784, hidden)
     var l2 = Linear(hidden, 10)
     var opt = SGD(collect(l1, l2), lr=0.01, momentum=0.9)
+    var use_jit = len(args) > 4 and String(args[4]) == "jit"
+    var jit = TinyJit()
+
+    def step(xs: List[Tensor]) raises {ref l1, ref l2, mut opt} -> List[Tensor]:
+        opt.zero_grad()
+        var l = l2(l1(xs[0]).relu()).sparse_categorical_crossentropy(xs[1])
+        l.backward()
+        opt.step([l])
+        return [l]
+
     var times = List[Int]()
     var loss = 0.0
     var total = 0
@@ -37,11 +48,10 @@ def main() raises:
             graph()[].stats.ns_execute = 0
             total = 0
         var t0 = perf_counter_ns()
-        opt.zero_grad()
-        var l = l2(l1(x).relu()).sparse_categorical_crossentropy(y)
-        l.backward()
-        opt.step([l])
-        loss = l.item()
+        if use_jit:
+            loss = jit(step, [x, y])[0].item()
+        else:
+            loss = step([x, y])[0].item()
         var dt = Int(perf_counter_ns() - t0)
         times.append(dt)
         total += dt

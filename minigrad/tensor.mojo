@@ -13,7 +13,9 @@ and semantics.
 """
 
 from std.math import cos, log, pi, sqrt
+from std.ffi import _Global
 from std.memory import ArcPointer, unsafe_memcpy
+from std.os import abort
 from std.utils.numerics import inf
 
 from minigrad.dtype import DT, promote, sum_acc_dtype
@@ -46,6 +48,15 @@ from minigrad.graph import (
     REDUCE_SUM,
 )
 from minigrad.runtime.blockops import mojo_dtype
+from minigrad.runtime.kernel import (
+    Instr,
+    JitStep,
+    STEP_COPY,
+    STEP_GATHER,
+    run_copy,
+    run_gather,
+    runtime,
+)
 from minigrad.schedule import realize
 from minigrad.uop import UOp, broadcast_shapes
 from minigrad.view import prod
@@ -61,6 +72,45 @@ def read_element(dt: DT, p: BytePtr, i: Int) -> Float64:
         if dt.code == c:
             return _read[mojo_dtype(c)](p, i)
     return 0.0
+
+
+def _record(var s: JitStep):
+    """Appends an eager operation to a capturing `TinyJit`'s tape."""
+    var rt = runtime()
+    if not rt[].recording:
+        return
+    var g = graph()
+    for b in s.ins:
+        g[].hold(b)
+    g[].hold(s.out)
+    rt[].tape.append(s^)
+
+
+struct JitState(Movable):
+    """The tensors a capturing `TinyJit` has seen assigned, with their
+    values before the step."""
+
+    var tensors: List[Tensor]
+    var before: List[UOp]
+
+    def __init__(out self):
+        self.tensors = List[Tensor]()
+        self.before = List[UOp]()
+
+
+def _init_jit_state() -> JitState:
+    return JitState()
+
+
+comptime _JIT_STATE = _Global["minigrad_jit_state", _init_jit_state]
+
+
+def jit_state() -> Pointer[JitState, MutUntrackedOrigin]:
+    """The assignments of the current `TinyJit` capture."""
+    try:
+        return _JIT_STATE.get_or_create_ptr()
+    except:
+        abort("minigrad: cannot create the jit state")
 
 
 def _read_all[dt: DType](p: BytePtr, n: Int, mut out: List[Float64]):
@@ -433,13 +483,34 @@ struct Tensor(ImplicitlyCopyable, Writable):
 
     def take_rows(self, rows: List[Int]) raises -> Tensor:
         """The given indices of dimension 0, gathered now: an embedding
+        lookup. See the overload taking a tensor of indices, which a
+        `TinyJit` can replay with new indices; this one cannot be
+        captured.
+
+        Raises:
+            If an index is out of range, or a `TinyJit` is capturing.
+        """
+        if runtime()[].recording:
+            raise Error(
+                "take_rows() with host indices inside a TinyJit: pass the"
+                " indices as a tensor"
+            )
+        var idx = List[Float64](capacity=len(rows))
+        for r in rows:
+            idx.append(Float64(r))
+        return self.take_rows(Tensor.from_list(idx, [len(rows)], DT.int32))
+
+    def take_rows(self, rows: Tensor) raises -> Tensor:
+        """The given indices of dimension 0, gathered now: an embedding
         lookup.
 
-        This tensor is realized first. The result is a new realized
-        tensor; it is not differentiable with respect to this one.
+        This tensor and `rows` are realized first. The result is a new
+        realized tensor; it is not differentiable with respect to this
+        one.
 
         Args:
-            rows: Indices into dimension 0, each in range.
+            rows: A 1-dimensional `int32` or `int64` tensor of indices
+                into dimension 0.
 
         Returns:
             A tensor of shape `(len(rows), shape[1:]...)`.
@@ -451,25 +522,54 @@ struct Tensor(ImplicitlyCopyable, Writable):
         var shape = u.shape()
         if len(shape) == 0:
             raise Error("take_rows() of a scalar")
-        var row_bytes = u.size() // max(shape[0], 1) * u.dtype().itemsize()
+        var idx = rows._contiguous_uop()
+        if idx.ndim() != 1:
+            raise Error(t"take_rows(): indices of shape {idx.shape()}")
         var out_shape = shape.copy()
-        out_shape[0] = len(rows)
-        var out = UOp.new_buffer(u.dtype(), out_shape)
+        out_shape[0] = idx.size()
+        var res = UOp.new_buffer(u.dtype(), out_shape)
         var g = graph()
-        var src = g[].buffer_ptr(u.id)
-        var dst = g[].buffer_ptr(out.id)
-        for i in range(len(rows)):
-            var r = rows[i]
-            if r < 0 or r >= shape[0]:
-                raise Error(t"take_rows(): index {r} out of range for {shape}")
-            unsafe_memcpy(
-                dest=dst.unsafe_offset(i * row_bytes),
-                src=src.unsafe_offset(r * row_bytes),
-                count=row_bytes,
-            )
-        return Tensor(out)
+        var s = JitStep(
+            STEP_GATHER,
+            -1,
+            List[Instr](),
+            [g[].nodes[u.id].arg[0], g[].nodes[idx.id].arg[0]],
+            g[].nodes[res.id].arg[0],
+        )
+        s.index_dt = idx.dtype()
+        s.n = idx.size()
+        s.row = u.size() // max(shape[0], 1) * u.dtype().itemsize()
+        s.limit = shape[0]
+        run_gather(
+            g[].buffer_ptr(u.id),
+            g[].buffer_ptr(idx.id),
+            g[].buffer_ptr(res.id),
+            s,
+        )
+        _record(s^)
+        _ = u^  # keep the source handles alive past the gather
+        _ = idx^
+        return Tensor(res)
 
     def write_(self, dim: Int, start: Int, value: Tensor) raises:
+        """Overwrites indices `[start, start + n)` of dimension `dim` with
+        `value`, now. See the overload taking `start` as a tensor, which a
+        `TinyJit` can replay at new positions; this one cannot be
+        captured.
+
+        Raises:
+            If the shapes do not fit, the tensor does not own its buffer,
+            or a `TinyJit` is capturing.
+        """
+        if runtime()[].recording:
+            raise Error(
+                "write_() at a host position inside a TinyJit: pass the"
+                " position as a tensor"
+            )
+        var at: List[Float64] = [Float64(start)]
+        self.write_(dim, Tensor.from_list(at, [1], DT.int32), value)
+
+    def write_(self, dim: Int, start: Tensor, value: Tensor) raises:
         """Overwrites indices `[start, start + n)` of dimension `dim` with
         `value`, now.
 
@@ -483,7 +583,8 @@ struct Tensor(ImplicitlyCopyable, Writable):
 
         Args:
             dim: The dimension to write along.
-            start: The first index written.
+            start: The first index written: an `int32` or `int64` tensor
+                of one element.
             value: The new elements: this tensor's shape, with `n` in
                 dimension `dim`. It is realized and converted to this
                 tensor's element type.
@@ -497,7 +598,7 @@ struct Tensor(ImplicitlyCopyable, Writable):
         if u.op() != OP_BUFFER:
             raise Error("write_() needs a realized tensor with its own buffer")
         var buffer = g[].nodes[u.id].arg[0]
-        if g[].buffers[buffer].rc != 1:
+        if g[].buffers[buffer].rc - g[].buffers[buffer].held != 1:
             raise Error("write_() on a buffer shared with another tensor")
         var d = self._axis(dim)
         var shape = u.shape()
@@ -507,27 +608,37 @@ struct Tensor(ImplicitlyCopyable, Writable):
         for i in range(len(shape)):
             if i != d and vshape[i] != shape[i]:
                 raise Error(t"write_() of shape {vshape} into {shape}")
-        var n = vshape[d]
-        if start < 0 or start + n > shape[d]:
-            raise Error(
-                t"write_() of {n} indices at {start} into a dimension of"
-                t" {shape[d]}"
-            )
         var v = value.cast(u.dtype())._contiguous_uop()
-        var outer = 1
+        var at = start._contiguous_uop()
+        if at.size() != 1:
+            raise Error("write_(): the start must be a one-element tensor")
+        var st = JitStep(
+            STEP_COPY,
+            -1,
+            List[Instr](),
+            [g[].nodes[v.id].arg[0], g[].nodes[at.id].arg[0]],
+            buffer,
+        )
+        st.index_dt = at.dtype()
+        st.n = vshape[d]
+        st.limit = shape[d]
+        st.outer = 1
         for i in range(d):
-            outer *= shape[i]
-        var inner = u.dtype().itemsize()
+            st.outer *= shape[i]
+        st.row = u.dtype().itemsize()
         for i in range(d + 1, len(shape)):
-            inner *= shape[i]
-        var src = g[].buffer_ptr(v.id)
-        var dst = g[].buffer_ptr(u.id)
-        for o in range(outer):
-            unsafe_memcpy(
-                dest=dst.unsafe_offset((o * shape[d] + start) * inner),
-                src=src.unsafe_offset(o * n * inner),
-                count=n * inner,
-            )
+            st.row *= shape[i]
+        run_copy(
+            g[].buffer_ptr(v.id),
+            g[].buffer_ptr(at.id),
+            g[].buffer_ptr(u.id),
+            st,
+        )
+        _record(st^)
+        # `x.id` is not a use of `x`: keep the handles (and so their
+        # buffers) alive past the copy.
+        _ = v^
+        _ = at^
 
     def to_string(self) raises -> String:
         """The elements as nested brackets, realizing the tensor."""
@@ -696,6 +807,17 @@ struct Tensor(ImplicitlyCopyable, Writable):
             raise Error(t"assign of shape {v.shape()} to {u.shape()}")
         if u.dtype() != v.dtype():
             raise Error(t"assign of dtype {v.dtype()} to {u.dtype()}")
+        if runtime()[].recording:
+            # A TinyJit capture remembers the value each tensor had
+            # before the step, to copy the new value back into it.
+            var st = jit_state()
+            var seen = False
+            for t in st[].tensors:
+                if t.cell is self.cell:
+                    seen = True
+            if not seen:
+                st[].tensors.append(self)
+                st[].before.append(u)
         self._replace(v)
         return self
 
