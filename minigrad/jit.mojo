@@ -1,13 +1,13 @@
 """Capture and replay of a step function (`minigrad.jit`).
 
-`TinyJit` runs a function of tensors the way tinygrad's `TinyJit` does:
+`MiniJit` runs a function of tensors the way tinygrad's `TinyJit` does:
 the first call runs it normally, the second runs it while recording
 every kernel and eager operation it causes, and every later call replays
 the recording with the new inputs' buffers, without running the
 function's code at all. No graph is built, scheduled, or planned.
 
 ```mojo
-var jit = TinyJit()
+var jit = MiniJit()
 def step(xs: List[Tensor]) raises -> List[Tensor]:
     opt.zero_grad()
     var loss = model(xs[0]).sparse_categorical_crossentropy(xs[1])
@@ -47,8 +47,10 @@ from minigrad.runtime.kernel import (
     STEP_COPY,
     STEP_GATHER,
     STEP_KERNEL,
+    STEP_SCATTER,
     run_copy,
     run_gather,
+    run_scatter,
     run_plan,
     runtime,
 )
@@ -56,7 +58,7 @@ from minigrad.tensor import Tensor, jit_state
 from minigrad.uop import UOp
 
 
-struct TinyJit(Movable):
+struct MiniJit(Movable):
     """A captured step function; see the module docstring."""
 
     var calls: Int
@@ -179,7 +181,7 @@ struct TinyJit(Movable):
             var before = st.before[i]
             if before.op() != OP_BUFFER:
                 raise Error(
-                    "TinyJit: a tensor assigned in the step must be realized"
+                    "MiniJit: a tensor assigned in the step must be realized"
                     " before it"
                 )
             var b0 = g[].nodes[before.id].arg[0]
@@ -202,7 +204,7 @@ struct TinyJit(Movable):
         var rt = runtime()
         if len(inputs) != len(self.inputs):
             raise Error(
-                t"TinyJit: {len(inputs)} inputs, captured with"
+                t"MiniJit: {len(inputs)} inputs, captured with"
                 t" {len(self.inputs)}"
             )
         var now = Dict[Int, Int]()
@@ -212,7 +214,7 @@ struct TinyJit(Movable):
                 or inputs[i].dtype() != self.in_dtypes[i]
             ):
                 raise Error(
-                    t"TinyJit: input {i} is {inputs[i].dtype()}"
+                    t"MiniJit: input {i} is {inputs[i].dtype()}"
                     t" {inputs[i].shape()}, captured as {self.in_dtypes[i]}"
                     t" {self.in_shapes[i]}"
                 )
@@ -228,6 +230,8 @@ struct TinyJit(Movable):
                     run_plan(rt[].plans[s.plan], dst, ins, s.instrs)
             elif s.kind == STEP_GATHER:
                 run_gather(ins[0], ins[1], dst, s)
+            elif s.kind == STEP_SCATTER:
+                run_scatter(ins[0], ins[1], dst, s)
             else:
                 run_copy(ins[0], ins[1], dst, s)
         for i in range(len(self.state_before)):

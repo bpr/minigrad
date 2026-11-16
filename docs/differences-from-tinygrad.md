@@ -14,7 +14,8 @@ introduced.
   there is no way to update part of a buffer. Reason: nodes are
   hash-consed, so tensors with equal values share buffers.
 - **`+=`, `-=`, `*=`** rebind the tensor the same way.
-- **`TinyJit`** is called as `jit(f, inputs)` with a list of tensors,
+- **`MiniJit`**, minigrad's `TinyJit`, is called as `jit(f, inputs)`
+  with a list of tensors,
   not as a decorator. A replay copies each tensor assigned in the step
   back into its old buffer, where tinygrad's in-place `assign` needs no
   copy. Host values are fixed at capture as in tinygrad, but `take_rows`
@@ -25,6 +26,12 @@ introduced.
   outside the graph, for key-value caches; tinygrad writes caches with
   `assign` into a slice (`cache[:, start:end].assign(x)`). The tensor
   must own its buffer.
+- **`put_rows_(rows, value)`** writes rows in place at scattered
+  indices, for a batch's caches; tinygrad assigns into a slice.
+- **Batched GPT-2 generation** takes prompts of different lengths, each
+  in its own cache slot with its own mask; tinygrad's example repeats one
+  prompt `batch_size` times. `Batcher` adds continuous batching, which
+  tinygrad's GPT-2 example does not have.
 - **`take_rows(ids)` is an eager, host-side embedding lookup** with a
   list of ints; tinygrad's `Embedding` is lazy and differentiable.
 - **GPT-2 decode attends to the cache rounded up to 64 rows**, masked;

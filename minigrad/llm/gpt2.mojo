@@ -22,7 +22,7 @@ from std.math import exp
 from std.utils.numerics import inf
 
 from minigrad.dtype import DT
-from minigrad.jit import TinyJit
+from minigrad.jit import MiniJit
 from minigrad.nn import quantize_int8
 from minigrad.safetensors import safe_load
 from minigrad.tensor import Tensor, _next_uniform
@@ -94,14 +94,17 @@ struct Block(Copyable):
     var fc_proj_w: Weight
     var fc_proj_b: Tensor
     var k_cache: Tensor
-    """`(max_context, n_embd)`: the keys of every position so far."""
+    """`(slots * max_context, n_embd)`: the keys of every position so
+    far, `max_context` rows per sequence."""
     var v_cache: Tensor
+    var max_context: Int
 
     def __init__(
         out self,
         mut w: Dict[String, Tensor],
         prefix: String,
         max_context: Int,
+        slots: Int,
         n_embd: Int,
         dtype: DT,
     ) raises:
@@ -118,22 +121,26 @@ struct Block(Copyable):
         self.fc_proj_w = Weight(w.pop(prefix + "mlp.c_proj.weight"), dtype, 1)
         self.fc_proj_b = w.pop(prefix + "mlp.c_proj.bias")
         # Zeros: rows not yet written are masked, and must not be NaN.
-        self.k_cache = Tensor.zeros(max_context, n_embd).contiguous().realize()
-        self.v_cache = Tensor.zeros(max_context, n_embd).contiguous().realize()
+        self.k_cache = (
+            Tensor.zeros(slots * max_context, n_embd).contiguous().realize()
+        )
+        self.v_cache = (
+            Tensor.zeros(slots * max_context, n_embd).contiguous().realize()
+        )
+        self.max_context = max_context
 
-    def __call__(
+    def prefill(
         self,
         x: Tensor,
-        start_pos: Int,
+        row: Int,
         start: Tensor,
         n_head: Int,
-        mask: Tensor,
     ) raises -> Tensor:
-        """The layer applied to `x`, `(T, n_embd)`: the tokens at
-        positions `start_pos ...`. Writes their keys and values into the
-        cache at `start`, which holds `start_pos` (a tensor, so that a
-        `TinyJit` replays the write at new positions). `mask` is 0 for
-        the cache's written rows and -inf for the rest."""
+        """The layer applied to `x`, `(T, n_embd)`: one sequence's
+        tokens, whose keys and values go to cache rows `start ...`
+        (`start`, a tensor, holds `row`; the sequence's slot begins at a
+        multiple of `max_context`). They attend to the slot's rows up to
+        their own, causally."""
         var t = x.shape()[0]
         var c = x.shape()[1]
         var hd = c // n_head
@@ -142,25 +149,47 @@ struct Block(Copyable):
         self.k_cache.write_(0, start, qkv.slice(1, c, 2 * c))
         self.v_cache.write_(0, start, qkv.slice(1, 2 * c, 3 * c))
         var q = qkv.slice(1, 0, c).reshape(t, n_head, hd).permute(1, 0, 2)
-        var a: Tensor
-        if t == 1:
-            var n = min(
-                (start_pos // DECODE_ROWS + 1) * DECODE_ROWS,
-                self.k_cache.shape()[0],
-            )
-            var k = self.k_cache.slice(0, 0, n).reshape(n, n_head, hd)
-            var v = self.v_cache.slice(0, 0, n).reshape(n, n_head, hd)
-            a = q.scaled_dot_product_attention(
-                k.permute(1, 0, 2), v.permute(1, 0, 2), mask.slice(0, 0, n)
-            )
-        else:
-            var l = start_pos + t
-            var k = self.k_cache.slice(0, 0, l).reshape(l, n_head, hd)
-            var v = self.v_cache.slice(0, 0, l).reshape(l, n_head, hd)
-            a = q.scaled_dot_product_attention(
-                k.permute(1, 0, 2), v.permute(1, 0, 2), None, is_causal=True
-            )
-        a = a.permute(1, 0, 2).reshape(t, c)
+        var first = row // self.max_context * self.max_context
+        var k = self.k_cache.slice(0, first, row + t).reshape(-1, n_head, hd)
+        var v = self.v_cache.slice(0, first, row + t).reshape(-1, n_head, hd)
+        var a = q.scaled_dot_product_attention(
+            k.permute(1, 0, 2), v.permute(1, 0, 2), None, is_causal=True
+        )
+        return self._finish(x, a.permute(1, 0, 2).reshape(t, c))
+
+    def decode(
+        self,
+        x: Tensor,
+        rows: Tensor,
+        n: Int,
+        n_head: Int,
+        mask: Tensor,
+    ) raises -> Tensor:
+        """The layer applied to `x`, `(B, n_embd)`: one new token for
+        each of the sequences in slots `0 .. B-1`, whose keys and values
+        go to cache rows `rows`. Each attends to the first `n` rows of
+        its slot, of which `mask`, `(slots, max_context)`, hides those
+        not yet written."""
+        var b = x.shape()[0]
+        var c = x.shape()[1]
+        var hd = c // n_head
+        var qkv = x.layernorm(-1, 1e-5) * self.ln1_w + self.ln1_b
+        qkv = self.attn_w(qkv) + self.attn_b
+        self.k_cache.put_rows_(rows, qkv.slice(1, c, 2 * c))
+        self.v_cache.put_rows_(rows, qkv.slice(1, 2 * c, 3 * c))
+        var q = qkv.slice(1, 0, c).reshape(b, 1, n_head, hd).permute(0, 2, 1, 3)
+        var slots = self.k_cache.shape()[0] // self.max_context
+        var k = self.k_cache.reshape(slots, self.max_context, n_head, hd)
+        var v = self.v_cache.reshape(slots, self.max_context, n_head, hd)
+        k = k.slice(0, 0, b).slice(1, 0, n).permute(0, 2, 1, 3)
+        v = v.slice(0, 0, b).slice(1, 0, n).permute(0, 2, 1, 3)
+        var m = mask.slice(0, 0, b).slice(1, 0, n).reshape(b, 1, 1, n)
+        var a = q.scaled_dot_product_attention(k, v, m)
+        return self._finish(x, a.permute(0, 2, 1, 3).reshape(b, c))
+
+    def _finish(self, x: Tensor, a: Tensor) raises -> Tensor:
+        """The rest of the layer after attention: projection, residual,
+        and the MLP."""
         var h = x + (self.proj_w(a) + self.proj_b)
         var m = h.layernorm(-1, 1e-5) * self.ln2_w + self.ln2_b
         m = (self.fc_w(m) + self.fc_b).gelu()
@@ -179,9 +208,13 @@ struct GPT2(Movable):
     var lnf_w: Tensor
     var lnf_b: Tensor
     var max_context: Int
+    var batch: Int
+    """The most sequences generated at once: the caches' slots."""
     var mask: Tensor
-    """`(max_context,)`: 0 at the positions the caches hold, -inf after."""
-    var jits: Dict[Int, TinyJit]
+    """`(batch * max_context,)`: 0 at the positions a slot's cache
+    holds, -inf after. Flat, because only a tensor that owns its buffer
+    can be written in place."""
+    var jits: Dict[Int, MiniJit]
     """Captured decode steps, one per block of `DECODE_ROWS` positions."""
 
     def __init__(
@@ -189,6 +222,7 @@ struct GPT2(Movable):
         path: String,
         max_context: Int = 1024,
         dtype: DT = DT.float32,
+        batch: Int = 1,
     ) raises:
         """Loads a model from a Hugging Face `model.safetensors`.
 
@@ -198,11 +232,12 @@ struct GPT2(Movable):
         Args:
             path: The weights file.
             max_context: The longest sequence to generate; the caches
-                take `2 * n_layer * max_context * n_embd` floats.
+                take `2 * n_layer * batch * max_context * n_embd` floats.
             dtype: How to store the token embedding and the layers'
                 matrices: `float32`, `float16`, `bfloat16`, or `int8`.
                 Biases, normalizations, and the position embedding stay
                 `float32`.
+            batch: The most sequences to generate at once.
         """
         if not (dtype == DT.float32 or dtype.is_half() or dtype == DT.int8):
             raise Error(t"GPT2: cannot store weights as {dtype}")
@@ -236,26 +271,37 @@ struct GPT2(Movable):
         for i in range(n_layer):
             self.blocks.append(
                 Block(
-                    w, "h." + String(i) + ".", self.max_context, n_embd, dtype
+                    w,
+                    "h." + String(i) + ".",
+                    self.max_context,
+                    batch,
+                    n_embd,
+                    dtype,
                 )
             )
         self.lnf_w = w.pop("ln_f.weight")
         self.lnf_b = w.pop("ln_f.bias")
-        self.mask = Tensor.empty([self.max_context])
-        self.jits = Dict[Int, TinyJit]()
+        self.batch = batch
+        self.mask = Tensor.empty([batch * self.max_context])
+        self.jits = Dict[Int, MiniJit]()
 
     def forward(
-        self, tokens: List[Int], start_pos: Int, all_positions: Bool = False
+        self,
+        tokens: List[Int],
+        start_pos: Int,
+        all_positions: Bool = False,
+        slot: Int = 0,
     ) raises -> Tensor:
         """The logits of the token after `tokens`, which sit at
-        positions `start_pos ...`; the cache must hold every earlier
-        position.
+        positions `start_pos ...` of the sequence in `slot`; the cache
+        must hold every earlier position of it.
 
         Args:
             tokens: The new tokens.
             start_pos: The position of the first.
             all_positions: Return the logits after every token, not
                 just the last (for measuring perplexity).
+            slot: Which of the `batch` sequences these tokens belong to.
 
         Returns:
             A realized `(vocab_size,)` tensor, or `(T, vocab_size)` with
@@ -267,70 +313,106 @@ struct GPT2(Movable):
                 t"GPT2: position {start_pos + t} is past the context of"
                 t" {self.max_context}"
             )
+        if slot < 0 or slot >= self.batch:
+            raise Error(t"GPT2: slot {slot} of {self.batch}")
         var positions = List[Int]()
         for i in range(start_pos, start_pos + t):
             positions.append(i)
+        var row = slot * self.max_context + start_pos
         if start_pos == 0:
             self.mask.write_(
-                0, 0, Tensor.full([self.max_context], -inf[DType.float64]())
+                0,
+                row,
+                Tensor.full([self.max_context], -inf[DType.float64]()),
             )
-        return self._run(
-            Tensor(tokens), Tensor(positions), start_pos, all_positions
-        )
+        self.mask.write_(0, row, Tensor.zeros(t))
+        var x = self._embed(Tensor(tokens), Tensor(positions))
+        var start = Tensor([row])
+        for i in range(len(self.blocks)):
+            x = self.blocks[i].prefill(x, row, start, self.config.n_head)
+        if not all_positions:
+            x = x.slice(0, t - 1, t)
+        var logits = self._logits(x)
+        if not all_positions:
+            logits = logits.reshape(self.config.vocab_size)
+        return logits.realize()
 
     def decode(mut self, token: Int, pos: Int) raises -> Tensor:
-        """`forward([token], pos)`, through a `TinyJit`: after two steps
-        in each block of `DECODE_ROWS` positions, a step replays the
-        recorded kernels without building or scheduling a graph.
+        """`forward([token], pos)` for the sequence in slot 0, through a
+        `MiniJit`; see `decode_batch`.
 
         Returns:
-            The `(vocab_size,)` logits, in a buffer the next `decode`
+            The `(vocab_size,)` logits, in a buffer the next decode
             overwrites: read them first.
         """
-        if pos < 1 or pos >= self.max_context:
-            raise Error(t"GPT2.decode: position {pos} out of range")
-        var key = pos // DECODE_ROWS
-        var jit = self.jits.pop(key, TinyJit())
+        return self.decode_batch([token], [pos]).reshape(self.config.vocab_size)
 
-        def step(xs: List[Tensor]) raises {ref self, var pos} -> List[Tensor]:
-            return [self._run(xs[0], xs[1], pos, False)]
+    def decode_batch(
+        mut self, tokens: List[Int], positions: List[Int]
+    ) raises -> Tensor:
+        """One step for the sequences in slots `0 .. B-1`: the logits of
+        the token after `tokens[b]`, which sits at `positions[b]` of
+        sequence `b`. The sequences may be of different lengths.
 
-        var out = jit(step, [Tensor([token]), Tensor([pos])])
+        Runs through a `MiniJit` per batch size and block of
+        `DECODE_ROWS` positions (of the longest sequence): after two
+        steps, a step replays the recorded kernels without building or
+        scheduling a graph. The weights are read once for the whole
+        batch, so a step of `B` sequences costs little more than one.
+
+        Returns:
+            `(B, vocab_size)` logits, in a buffer the next decode
+            overwrites: read them first.
+        """
+        var b = len(tokens)
+        if b < 1 or b > self.batch or len(positions) != b:
+            raise Error(
+                t"GPT2.decode_batch: {b} tokens and {len(positions)}"
+                t" positions for {self.batch} slots"
+            )
+        var longest = 0
+        var rows = List[Int]()
+        for i in range(b):
+            if positions[i] < 1 or positions[i] >= self.max_context:
+                raise Error(
+                    t"GPT2.decode_batch: position {positions[i]} out of range"
+                )
+            longest = max(longest, positions[i])
+            rows.append(i * self.max_context + positions[i])
+        var n = min(
+            (longest // DECODE_ROWS + 1) * DECODE_ROWS, self.max_context
+        )
+        var key = b * 65536 + n
+        var jit = self.jits.pop(key, MiniJit())
+
+        def step(xs: List[Tensor]) raises {ref self, var n} -> List[Tensor]:
+            self.mask.put_rows_(xs[2], Tensor.zeros(xs[2].shape()[0]))
+            var mask = self.mask.reshape(self.batch, self.max_context)
+            var x = self._embed(xs[0], xs[1])
+            for i in range(len(self.blocks)):
+                x = self.blocks[i].decode(x, xs[2], n, self.config.n_head, mask)
+            return [self._logits(x)]
+
+        var out = jit(step, [Tensor(tokens), Tensor(positions), Tensor(rows)])
         self.jits[key] = jit^
         return out[0]
 
-    def _run(
-        self,
-        tokens: Tensor,
-        positions: Tensor,
-        start_pos: Int,
-        all_positions: Bool,
-    ) raises -> Tensor:
-        """The forward pass, with the tokens and their positions as
-        `int32` tensors; `start_pos` (the first position) only sets
-        shapes."""
-        var t = tokens.shape()[0]
+    def _embed(self, tokens: Tensor, positions: Tensor) raises -> Tensor:
+        """The token plus position embeddings; both are `int32` tensors."""
         var x = self.wte.w.take_rows(tokens).float()
         if self.wte.scale:
             x = x * self.wte.scale.value().take_rows(tokens)
-        x = x + self.wpe.take_rows(positions)
-        var start = positions.slice(0, 0, 1)
-        self.mask.write_(0, start, Tensor.zeros(t))
-        for i in range(len(self.blocks)):
-            x = self.blocks[i](
-                x, start_pos, start, self.config.n_head, self.mask
-            )
-        if not all_positions:
-            x = x.slice(0, t - 1, t)
-        x = x.layernorm(-1, 1e-5) * self.lnf_w + self.lnf_b
-        var logits = x.dot(self.wte.w.T())
+        return x + self.wpe.take_rows(positions)
+
+    def _logits(self, x: Tensor) raises -> Tensor:
+        """The final normalization and the output projection."""
+        var h = x.layernorm(-1, 1e-5) * self.lnf_w + self.lnf_b
+        var logits = h.dot(self.wte.w.T())
         if self.wte.scale:
             logits = logits * self.wte.scale.value().reshape(
                 1, self.config.vocab_size
             )
-        if not all_positions:
-            logits = logits.reshape(self.config.vocab_size)
-        return logits.realize()
+        return logits
 
     def perplexity(self, tokens: List[Int]) raises -> Float64:
         """The model's perplexity on `tokens`: `exp` of the mean
@@ -377,6 +459,52 @@ struct GPT2(Movable):
             if i + 1 < count:
                 logits = self.decode(next, pos)
                 pos += 1
+        return out^
+
+    def generate_batch(
+        mut self,
+        prompts: List[List[Int]],
+        count: Int,
+        temperature: Float64 = 0.0,
+        top_k: Int = 0,
+    ) raises -> List[List[Int]]:
+        """Continues each prompt by `count` tokens, all at once.
+
+        Each prompt is processed in its own slot; then every step adds
+        one token to every sequence. A sequence that produces
+        `<|endoftext|>` keeps going (trim it afterwards).
+
+        Args:
+            prompts: Up to `batch` prompts, each at least one token,
+                each with room for `count` more within `max_context`.
+            count: How many tokens to add to each.
+            temperature: As for `generate`.
+            top_k: As for `generate`.
+
+        Returns:
+            The new tokens of each prompt.
+        """
+        var b = len(prompts)
+        if b < 1 or b > self.batch:
+            raise Error(t"GPT2: {b} prompts for {self.batch} slots")
+        var out = List[List[Int]]()
+        var next = List[Int]()
+        var positions = List[Int]()
+        for i in range(b):
+            var logits = self.forward(prompts[i], 0, slot=i)
+            next.append(sample(logits.tolist(), temperature, top_k))
+            positions.append(len(prompts[i]))
+            out.append([next[i]])
+        var v = self.config.vocab_size
+        for _ in range(count - 1):
+            var all = self.decode_batch(next, positions).tolist()
+            for i in range(b):
+                var row = List[Float64](capacity=v)
+                for j in range(v):
+                    row.append(all[i * v + j])
+                next[i] = sample(row, temperature, top_k)
+                out[i].append(next[i])
+                positions[i] += 1
         return out^
 
 

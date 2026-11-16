@@ -24,9 +24,25 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
    against tinygrad and tiktoken. Decode is within about 25% of the
    memory-bandwidth floor for float32 weights, and 16-bit or int8
    weights cut decode time by half or more. What remains:
-   - **Batches of sequences** and **continuous batching** (the brief's
-     decode scenario with 1 to 64 active sequences): a cache per
-     sequence, ragged lengths, and a scheduler of requests.
+   - **Batched throughput.** `generate_batch` decodes up to `batch`
+     sequences of different lengths in lockstep and gives each the
+     tokens it gets alone. Its throughput is not yet measured on a
+     quiet machine; in noisy runs the gain was well short of the
+     batch size. The matrix-vector path's arithmetic is the suspect: at
+     8 rows it managed about 0.3 multiply-adds per cycle per core (sums
+     kept in memory); a register-tiled rewrite measured no better and
+     was dropped, and the tiled kernel now takes 4 rows and up. Measure
+     first, then look at the tiled kernel's packing of B, which a step
+     repeats for every matrix.
+   - **Continuous batching performance.** `Batcher` works (requests
+     arriving at any time get the tokens they get alone) but is not
+     measured on a quiet machine; at a load average of 15 it was slower
+     than serving requests one at a time. Things to try, in order, once
+     numbers are reliable: step all slots every time (one `MiniJit`
+     capture per 64-position block instead of one per active-slot count
+     and block); the batched throughput item above; and a slot layout
+     that does not reserve `max_context` rows per sequence (pages of
+     the cache, as vLLM does) if memory, not time, becomes the limit.
    - **Better quantization.** Weights can be `float16`, `bfloat16`, or
      per-output `int8` (4.3% higher perplexity on Shakespeare). Scales
      per group of 32 to 128 inputs would recover most of that and allow
@@ -45,7 +61,7 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
    - Slicing with steps and `__getitem__` with ranges; `cumsum`;
      `multinomial`.
 2. **Host work per step** is mostly gone where it matters: schedules
-   are cached by structure, and `TinyJit` replays whole steps (a small
+   are cached by structure, and `MiniJit` replays whole steps (a small
    MLP training step 78 to 21 µs; GPT-2 decode saves about 0.9 ms per
    token in the one clean measurement so far, to be confirmed in quiet
    time). Left: steps that cannot be captured (host values that change,

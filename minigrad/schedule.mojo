@@ -460,7 +460,7 @@ struct _Scheduler(Movable):
 
 def _run(ck: CachedKernel, root: Int, in_bufs: List[Int]) raises:
     """Runs one kernel, reading buffers `in_bufs`, into a new buffer, and
-    makes `root` that buffer. A `TinyJit` capture records it."""
+    makes `root` that buffer. A `MiniJit` capture records it."""
     var g = graph()
     var rt = runtime()
     var out_buf = g[].alloc_buffer(ck.nbytes)

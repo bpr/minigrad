@@ -59,13 +59,18 @@ Early. What works, on CPU:
   MojoDEC.
 - **MNIST**: `examples/mnist.mojo` trains tinygrad's `beautiful_mnist`
   model to 97.9% test accuracy in 70 steps.
+- **Batched generation**: `GPT2(..., batch=B)` and `generate_batch`
+  continue up to `B` prompts of different lengths at once, each getting
+  the tokens it would get alone; each step reads the weights once for
+  all of them.
 - **GPT-2 inference**: `examples/gpt2.mojo` loads Hugging Face's
   safetensors weights, tokenizes with GPT-2's BPE, and generates with a
   key-value cache. Its greedy output matches tinygrad's token for token,
   its logits agree to 2e-4, and its tokenizer agrees with tiktoken.
 
-- **Schedule caching and `TinyJit`**: a graph of the same structure as
-  one scheduled before replays its recorded kernels; `TinyJit` goes
+- **Schedule caching and `MiniJit`**: a graph of the same structure as
+  one scheduled before replays its recorded kernels; `MiniJit` (like
+  tinygrad's `TinyJit`) goes
   further and replays a whole step without running its code (a small
   training step: 78 to 21 µs). GPT-2's `decode` uses it.
 - **Lower-precision weights**: GPT-2's matrices can be stored as
@@ -74,8 +79,11 @@ Early. What works, on CPU:
   halve decode time with no measurable loss; int8 cuts it by about 55%
   for about 4% higher perplexity.
 
-What does not exist yet: a GPU backend, Python bindings, batched
-generation, group-wise or 4-bit quantization, indexing with slices and
+- **Continuous batching**: `Batcher` serves requests that arrive at any
+  time, up to `batch` at once, a finished one's slot going to the next.
+
+What does not exist yet: a GPU backend, Python bindings, an HTTP server
+in front of the batcher, group-wise or 4-bit quantization, indexing with slices and
 index tensors, and models beyond GPT-2. `docs/plan.md` has the order of
 work.
 
@@ -93,7 +101,7 @@ minigrad needs [pixi](https://pixi.sh) and Linux on x86-64.
 
 ```sh
 pixi install
-pixi run test                                  # 120 tests, about a minute
+pixi run test                                  # 122 tests, about a minute
 
 bash examples/get_mnist.sh                     # 55 MB into data/mnist/
 pixi run mojo run -I . examples/mnist.mojo     # 70 steps, batch 512

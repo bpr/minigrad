@@ -217,7 +217,7 @@ struct Buffer(Movable):
     var rc: Int
     """References: `BUFFER` nodes that share this memory, plus holds."""
     var held: Int
-    """References from `TinyJit` captures, which replay into the buffer
+    """References from `MiniJit` captures, which replay into the buffer
     (counted in `rc` too)."""
 
     def __init__(out self, ptr: BytePtr, nbytes: Int):

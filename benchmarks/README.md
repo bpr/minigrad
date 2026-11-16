@@ -98,13 +98,13 @@ kernel building, about 0.3 ms per step, disappears, and computing the
 graph's signature adds about 0.06 ms. A small MLP training step went
 from 103 to 78 µs. Compare with `MINIGRAD_SCHEDULE_CACHE=0`.
 
-### TinyJit
+### MiniJit
 
 A replay runs the recorded kernels without building, scheduling, or
 planning a graph. On a busy machine (load average 2 to 3), so treat the
 decode figure as provisional:
 
-| | plain | `TinyJit` |
+| | plain | `MiniJit` |
 |---|---:|---:|
 | MLP training step, batch 8, hidden 32 | 78 µs | 21 µs |
 | MLP training step, batch 64, hidden 128 | 169 µs | 120 µs |
@@ -112,6 +112,30 @@ decode figure as provisional:
 
 The final losses with and without the JIT are identical. tinygrad's
 `TinyJit` takes 828 µs for the first MLP row.
+
+### Batched generation
+
+`build/gpt2_bench batch B N IDS...` decodes `B` sequences of different
+lengths at once. Correctness is tested (each sequence gets the greedy
+tokens it gets alone); throughput is not yet measured on a quiet
+machine. The runs so far happened at load averages of 9 to 15 on 16
+hardware threads, which preempts the thread pool mid-product and
+penalizes larger batches most; in them, batch 16 gave 1.6 to 2.3 times
+the tokens per second of batch 1. To measure in quiet time:
+
+```sh
+for b in 1 2 4 8 16; do build/gpt2_bench --dtype int8 batch $b 40 $IDS; done
+```
+
+### Continuous batching
+
+`build/gpt2_bench serve S R IDS...` serves `R` requests (prompts of 3
+or more tokens, 16 to 63 new tokens each, all arriving at once) with a
+`Batcher` of `S` slots, then one at a time, and prints throughput and
+mean completion time for both. Not yet measured on a quiet machine: the
+one run so far, at a load average of 15, gave 129 tokens/s batched (8
+slots, 24 requests) against 148 one at a time, which says more about the
+load than about batching.
 
 ### Lower-precision weights
 

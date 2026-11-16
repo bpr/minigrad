@@ -167,9 +167,38 @@ Set `MINIGRAD_SCHEDULE_CACHE=0` to schedule every time.
 What a hit still costs is building the graph: the user's code runs every
 step, creating about 2,500 nodes for a GPT-2 decode step (about 0.65 ms).
 
+### Batches of sequences
+
+`GPT2(..., batch=B)` keeps `B` slots: each layer's caches are
+`(B * max_context, n_embd)`, slot `s` at rows `s * max_context ...`, and
+the mask is one flat `(B * max_context)` buffer (flat because only a
+tensor that owns its buffer can be written in place). `generate_batch`
+processes each prompt into its own slot with the single-sequence path,
+then `decode_batch` advances every sequence by one token per step, each
+at its own position: the new keys and values go to scattered rows by
+`put_rows_` (the in-place inverse of `take_rows`, replayable by
+`MiniJit`), and each sequence attends to the first `n` rows of its slot
+(`n` from the longest sequence, in blocks of 64) with its own row of the
+mask hiding the rest.
+
+`Batcher` (`minigrad/llm/batching.mojo`) runs requests continuously on
+top of this: each step admits waiting requests to the lowest free slots
+(processing their prompts), then advances slots `0 .. h-1` by one token,
+`h` one past the highest occupied slot; free slots below `h` compute a
+dummy token at their own position 1, which the next prompt in that slot
+overwrites. A request that reaches its token limit, `<|endoftext|>`, or
+the end of the context frees its slot. There is no paging and no
+copying of caches: a slot is `max_context` rows whether used or not.
+
+The point of batching is that each step reads the weights once for all
+sequences. With few rows `gemm` streams the weights in its
+matrix-vector path; that path keeps each row's sums in memory and slows
+as rows are added, so from 4 rows the tiled kernel takes over.
+
 ### Capture and replay
 
-`TinyJit` (`minigrad/jit.mojo`) removes that too, as tinygrad's does: it
+`MiniJit` (`minigrad/jit.mojo`) removes that too, as tinygrad's `TinyJit`
+does: it
 runs a step function once, runs it again while the runtime records a
 tape of everything that touches memory, and from then on replays the
 tape without running the function. The tape has three kinds of step: a
@@ -189,7 +218,7 @@ needs no copy). And values that change every call must be tensors: the
 eager operations take their indices from tensors (`take_rows(rows:
 Tensor)`, `write_(dim, start: Tensor, ...)`), and their host-integer
 forms raise during a capture rather than baking a stale value into the
-tape. GPT-2's `decode` keeps one `TinyJit` per block of 64 positions,
+tape. GPT-2's `decode` keeps one `MiniJit` per block of 64 positions,
 since attention's shapes change at each block.
 
 ## Plans

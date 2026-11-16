@@ -262,7 +262,7 @@ def test_gpt2_greedy() raises:
 
 def test_gpt2_decode_matches_prompt() raises:
     """Decoding token by token (masked attention over 64-row blocks of
-    the cache, schedules replayed, and through TinyJit) gives the logits
+    the cache, schedules replayed, and through MiniJit) gives the logits
     that processing the whole sequence at once does, across a block
     boundary."""
     if not exists("data/gpt2/model.safetensors"):
@@ -285,11 +285,79 @@ def test_gpt2_decode_matches_prompt() raises:
     var whole = model.forward(ids, 0)
     assert_close(logits, whole.tolist(), 2e-3)
     assert_true(graph()[].stats.schedule_hits > hits + 8)
-    # The same through TinyJit: steps 3 onward in each block replay.
+    # The same through MiniJit: steps 3 onward in each block replay.
     _ = model.forward(head, 0)
     for p in range(58, 70):
         logits = model.decode(ids[p], p)
     assert_close(logits, whole.tolist(), 2e-3)
+
+
+def test_gpt2_batch_matches_single() raises:
+    """Generating several prompts of different lengths together gives
+    each the greedy tokens it gets alone, across a block boundary."""
+    if not exists("data/gpt2/model.safetensors"):
+        print("skipped: run examples/get_gpt2.sh for data/gpt2")
+        return
+    from minigrad.llm.gpt2 import GPT2
+
+    var prompts = List[List[Int]]()
+    prompts.append(
+        [2061, 318, 262, 3280, 284, 1204, 11, 262, 6881, 11, 290, 2279, 30]
+    )
+    prompts.append([15496, 13])
+    var long = List[Int]()
+    for i in range(55):
+        long.append((i * 7919) % 50000)
+    prompts.append(long^)
+    var together = GPT2("data/gpt2/model.safetensors", 128, batch=3)
+    var got = together.generate_batch(prompts, 16)
+    var alone = GPT2("data/gpt2/model.safetensors", 128)
+    for i in range(3):
+        assert_equal(got[i], alone.generate(prompts[i], 16))
+
+
+def test_continuous_batching() raises:
+    """Requests arriving over time, more than there are slots, each get
+    the greedy tokens they get alone; finished requests free their slots
+    (including slots below occupied ones) for waiting ones."""
+    if not exists("data/gpt2/model.safetensors"):
+        print("skipped: run examples/get_gpt2.sh for data/gpt2")
+        return
+    from minigrad.llm.batching import Batcher
+    from minigrad.llm.gpt2 import GPT2
+
+    var prompts = List[List[Int]]()
+    prompts.append(
+        [2061, 318, 262, 3280, 284, 1204, 11, 262, 6881, 11, 290, 2279, 30]
+    )
+    prompts.append([15496, 13])
+    var long = List[Int]()
+    for i in range(55):
+        long.append((i * 7919) % 50000)
+    prompts.append(long^)
+    prompts.append([464, 2068, 7586, 21831, 18045, 625, 262])
+    prompts.append([40, 1101])
+    var limits: List[Int] = [12, 4, 15, 8, 6]
+    var b = Batcher(
+        GPT2("data/gpt2/model.safetensors", 128, batch=3), stop_at_eot=False
+    )
+    var ids = List[Int]()
+    for i in range(3):
+        ids.append(b.submit(prompts[i], limits[i]))
+    var steps = 0
+    var peak = 0
+    while b.step():
+        steps += 1
+        peak = max(peak, b.active())
+        if steps == 2:
+            ids.append(b.submit(prompts[3], limits[3]))  # waits for a slot
+        if steps == 5:
+            ids.append(b.submit(prompts[4], limits[4]))
+    assert_equal(peak, 3)
+    var alone = GPT2("data/gpt2/model.safetensors", 128)
+    for i in range(5):
+        assert_true(b.finished(ids[i]))
+        assert_equal(b.output(ids[i]), alone.generate(prompts[i], limits[i]))
 
 
 def test_gpt2_perplexity() raises:

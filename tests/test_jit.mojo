@@ -1,4 +1,4 @@
-"""TinyJit: a replay computes what running the function would, for
+"""MiniJit: a replay computes what running the function would, for
 pure functions, training steps (state through `assign`), and eager
 operations indexed by tensors."""
 
@@ -6,7 +6,7 @@ from std.testing import TestSuite, assert_equal, assert_true, assert_false
 
 from minigrad.dtype import DT
 from minigrad.graph import graph
-from minigrad.jit import TinyJit
+from minigrad.jit import MiniJit
 from minigrad.nn import Adam, Linear, SGD, collect
 from minigrad.tensor import Tensor
 from helpers import assert_close
@@ -25,7 +25,7 @@ def f_pure(xs: List[Tensor]) raises -> List[Tensor]:
 
 
 def test_pure_function() raises:
-    var jit = TinyJit()
+    var jit = MiniJit()
     for call in range(5):
         var a = Tensor.from_list(_data(12, call), [3, 4]).contiguous().realize()
         var b = (
@@ -42,7 +42,7 @@ def test_pure_function() raises:
 
 
 def test_shape_change_raises() raises:
-    var jit = TinyJit()
+    var jit = MiniJit()
     var a = Tensor.ones(3, 4)
     var b = Tensor.ones(4, 5)
     _ = jit(f_pure, [a, b])
@@ -63,7 +63,7 @@ def _train(use_jit: Bool, adam: Bool) raises -> List[Float64]:
     var params = collect(l1, l2)
     var sgd = SGD(params, lr=0.05, momentum=0.9)
     var adm = Adam(params, lr=0.01)
-    var jit = TinyJit()
+    var jit = MiniJit()
     var out = List[Float64]()
 
     def step(
@@ -111,7 +111,7 @@ def f_cache(xs: List[Tensor]) raises -> List[Tensor]:
 def test_eager_ops_replay() raises:
     var table = Tensor.arange(15).reshape(5, 3).float().contiguous().realize()
     var cache = Tensor.zeros(6, 3).contiguous().realize()
-    var jit = TinyJit()
+    var jit = MiniJit()
     for pos in range(6):
         var idx = Tensor(List[Int]([(pos * 2) % 5]))
         var at = Tensor(List[Int]([pos]))
@@ -132,7 +132,7 @@ def f_host_index(xs: List[Tensor]) raises -> List[Tensor]:
 
 
 def test_host_indices_refused() raises:
-    var jit = TinyJit()
+    var jit = MiniJit()
     var t = Tensor.ones(3, 2)
     _ = jit(f_host_index, [t])
     var raised = False

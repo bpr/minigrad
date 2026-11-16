@@ -717,11 +717,13 @@ struct CachedKernel(Copyable):
 comptime STEP_KERNEL = 0
 comptime STEP_GATHER = 1
 comptime STEP_COPY = 2
+comptime STEP_SCATTER = 3
 
 
 struct JitStep(Copyable):
-    """One thing a `TinyJit` capture does, by buffer id: run a kernel,
-    gather rows (`take_rows`), or copy rows in place (`write_`)."""
+    """One thing a `MiniJit` capture does, by buffer id: run a kernel,
+    gather rows (`take_rows`), copy a range in place (`write_`), or
+    scatter rows in place (`put_rows_`)."""
 
     var kind: Int
     var plan: Int
@@ -729,7 +731,7 @@ struct JitStep(Copyable):
     var instrs: List[Instr]
     var ins: List[Int]
     """Buffers read: a kernel's loads; `[table, index]` for a gather;
-    `[source, start]` for a copy."""
+    `[source, start]` for a copy; `[source, index]` for a scatter."""
     var out: Int
     """The buffer written."""
     var index_dt: DT
@@ -805,6 +807,22 @@ def run_copy(src: BytePtr, start: BytePtr, dst: BytePtr, s: JitStep) raises:
         )
 
 
+def run_scatter(src: BytePtr, index: BytePtr, dst: BytePtr, s: JitStep) raises:
+    """Copies row `i` of `src` to row `index[i]` of `dst`, for each of
+    the `n` indices."""
+    for i in range(s.n):
+        var r = read_index(index, s.index_dt, i)
+        if r < 0 or r >= s.limit:
+            raise Error(
+                t"put_rows_(): index {r} out of range for {s.limit} rows"
+            )
+        unsafe_memcpy(
+            dest=dst.unsafe_offset(r * s.row),
+            src=src.unsafe_offset(i * s.row),
+            count=s.row,
+        )
+
+
 comptime SCHEDULE_CACHE_LIMIT = 1024
 """Schedules kept before the cache is emptied and starts over."""
 
@@ -823,7 +841,7 @@ struct Runtime(Movable):
     """False when the environment variable `MINIGRAD_SCHEDULE_CACHE` is
     0, to compare against scheduling every time."""
     var recording: Bool
-    """Whether a `TinyJit` is capturing: kernels and eager operations
+    """Whether a `MiniJit` is capturing: kernels and eager operations
     are appended to `tape`, and their buffers held."""
     var tape: List[JitStep]
     var scratch: BytePtr

@@ -11,7 +11,7 @@ from std.sys import argv
 from std.time import perf_counter_ns
 
 from minigrad.graph import graph
-from minigrad.jit import TinyJit
+from minigrad.jit import MiniJit
 from minigrad.nn import Linear, SGD, collect
 from minigrad.tensor import Tensor
 
@@ -28,7 +28,7 @@ def main() raises:
     var l2 = Linear(hidden, 10)
     var opt = SGD(collect(l1, l2), lr=0.01, momentum=0.9)
     var use_jit = len(args) > 4 and String(args[4]) == "jit"
-    var jit = TinyJit()
+    var jit = MiniJit()
 
     def step(xs: List[Tensor]) raises {ref l1, ref l2, mut opt} -> List[Tensor]:
         opt.zero_grad()

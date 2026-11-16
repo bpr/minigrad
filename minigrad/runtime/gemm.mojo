@@ -306,8 +306,12 @@ def _block_task[dt: DType, bdt: DType](ctx: Int, i: Int):
 comptime GEMV_PARALLEL_WORK = 1_000_000
 """Multiply-adds from which a matrix-vector product uses threads."""
 
-comptime GEMV_ROWS = 16
-"""Rows of C up to which `gemm` streams B once instead of tiling."""
+comptime GEMV_ROWS = 3
+"""Rows of C up to which `gemm` streams B once instead of tiling. The
+streaming loop keeps each row's sums in memory, so its arithmetic slows
+as rows are added; from 4 rows the tiled kernel, which packs B and keeps
+an 8 by 32 tile in registers, is faster (measured on GPT-2's MLP: 16
+rows took 280 µs streamed and 110 µs tiled)."""
 
 comptime CHUNKS_PER_THREAD = 4
 """Pieces a product splits into per thread, when splitting is free."""

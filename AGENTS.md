@@ -74,10 +74,10 @@ Tests import `tests/helpers.mojo`, so they need `-I tests` as well
 | `minigrad/nn/` | Layers (`Linear`, `Conv2d`, `BatchNorm`, `LayerNorm`) and optimizers (`SGD`, `Adam`, `AdamW`) |
 | `minigrad/datasets.mojo` | MNIST loader |
 | `minigrad/nn/__init__.mojo` (end) | `quantize_int8`: symmetric int8 with a scale per output |
-| `minigrad/jit.mojo` | `TinyJit`: capture a step function's kernels and eager operations, then replay them |
+| `minigrad/jit.mojo` | `MiniJit`: capture a step function's kernels and eager operations, then replay them |
 | `minigrad/linalg.mojo` | Eager dense linear algebra: `solve`, `det`, `inv`, `cholesky`, `eigh` (copied from MojoDEC) |
 | `minigrad/json.mojo`, `minigrad/safetensors.mojo` | A minimal JSON reader; reading safetensors weights |
-| `minigrad/llm/` | `bpe.mojo` (GPT-2's tokenizer), `gpt2.mojo` (the model, with a key-value cache) |
+| `minigrad/llm/` | `bpe.mojo` (GPT-2's tokenizer), `gpt2.mojo` (the model, with a key-value cache per slot), `batching.mojo` (`Batcher`: continuous batching) |
 | `tests/` | One `test_*.mojo` per area; `helpers.mojo` has `assert_close` |
 | `examples/` | `mnist.mojo`, `gpt2.mojo` (need `examples/get_mnist.sh`, `examples/get_gpt2.sh` first) |
 | `benchmarks/` | Mojo programs and their tinygrad counterparts in `benchmarks/tinygrad/` |
@@ -150,10 +150,15 @@ Design points that span several files:
   view.
 - **Reference counts**: a node's `rc` counts `UOp` handles and parent
   nodes. Gradient slots hold a raw id with a manual `incref`/`decref`.
-- **Two eager operations sit outside the graph**: `take_rows` (an
-  embedding lookup, done on the host) and `write_` (the one in-place
-  write, for key-value caches; the target must own its buffer). Views of
-  a written tensor see the writes.
+- **Eager operations sit outside the graph**: `take_rows` (an embedding
+  lookup, done on the host), `write_` (an in-place range write, for
+  key-value caches) and `put_rows_` (in-place scattered rows, for a
+  batch's caches). The targets of the writes must own their buffers.
+  Views of a written tensor see the writes. All three take indices as
+  tensors so `MiniJit` replays them.
+- **GPT-2 batches by slots**: caches are `(batch * max_context,
+  n_embd)`, slot `s` at row `s * max_context`; `forward(..., slot=s)`
+  prefills one sequence, `decode_batch` steps slots `0 .. B-1`.
 - **Weights in lower precision are a cast, not a format.** A
   contraction operand may be a cast of a buffer (`float16`, `bfloat16`,
   `int8` into a `float32` kernel): the scheduler leaves it unmaterialized,
@@ -173,7 +178,7 @@ Design points that span several files:
   `eigh`), on flat lists instead of NuMojo arrays. Fix bugs in both. The
   user chose copying over a shared library for now and will revisit if
   duplication spreads across projects.
-- **`TinyJit` replays a tape** recorded in `runtime().tape` while
+- **`MiniJit` replays a tape** recorded in `runtime().tape` while
   `recording` is set: kernels (from `schedule._run`), gathers, and copies
   (`_record` in `tensor.mojo`), by buffer id. Captured buffers are held
   (`Graph.hold`; `write_`'s ownership check subtracts holds). `assign`
