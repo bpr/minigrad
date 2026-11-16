@@ -187,6 +187,72 @@ def test_matmul_sizes() raises:
     assert_true(graph()[].stats.gemm_kernels > before)
 
 
+def test_matrix_vector() raises:
+    """Few rows: B streamed once, by columns or by rows, threaded past
+    a million multiply-adds."""
+    var before = graph()[].stats.gemm_kernels
+    check_matmul(1, 7, 300)
+    check_matmul(2, 300, 9)
+    check_matmul(16, 33, 70)
+    check_matmul(1, 768, 2304)
+    check_matmul(3, 512, 1000)
+    assert_true(graph()[].stats.gemm_kernels >= before + 15)
+
+
+def test_batched_contraction_threads() raises:
+    """Heads as a batch dimension, small and large per product."""
+    for shape in [(12, 1, 64, 40), (12, 30, 64, 40), (4, 200, 64, 300)]:
+        var h = shape[0]
+        var t = shape[1]
+        var d = shape[2]
+        var l = shape[3]
+        var q = _seq([h, t, d])
+        var k = _seq([h, d, l]) * 0.5
+        var qd = q.tolist()
+        var kd = k.tolist()
+        var expect = List[Float64]()
+        for i in range(h):
+            var pq = List[Float64]()
+            var pk = List[Float64]()
+            for e in range(t * d):
+                pq.append(qd[i * t * d + e])
+            for e in range(d * l):
+                pk.append(kd[i * d * l + e])
+            for v in _matmul_ref(pq, pk, t, d, l):
+                expect.append(v)
+        assert_close(q @ k, expect, 2e-2)
+
+
+def test_converted_operand() raises:
+    """A float32 product with the other operand stored narrower: gemm
+    converts it as it reads, in every path (few rows, tiles, a batch),
+    and must equal the product with a float32 copy."""
+    var before = graph()[].stats.gemm_kernels
+    for shape in [(1, 300, 70), (3, 64, 1000), (40, 100, 90)]:
+        var n = shape[0]
+        var k = shape[1]
+        var m = shape[2]
+        var x = _seq([n, k])
+        var w = _seq([k, m])
+        for dt in [DT.float16, DT.bfloat16, DT.int8]:
+            var wq = (w * 4.0).round().cast(dt).realize()
+            var expect = (x @ wq.float().contiguous()).tolist()
+            assert_close(x @ wq, expect, 1e-3)
+            # Stored transposed, as an output projection is.
+            var wt = wq.T().contiguous().realize()
+            assert_close(x @ wt.T(), expect, 1e-3)
+            # Converted on the left too.
+            assert_close(
+                wt @ x.T(), (wt.float().contiguous() @ x.T()).tolist(), 1e-3
+            )
+    var heads = _seq([4, 6, 32])
+    var keys = _seq([4, 32, 50]).cast(DT.bfloat16).realize()
+    assert_close(
+        heads @ keys, (heads @ keys.float().contiguous()).tolist(), 1e-3
+    )
+    assert_true(graph()[].stats.gemm_kernels >= before + 30)
+
+
 def test_matmul_float64_and_ints() raises:
     var a = _seq([9, 11], DT.float64)
     var b = _seq([11, 6], DT.float64)

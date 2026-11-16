@@ -195,9 +195,72 @@ is the answer to that, and `gemm` is the answer where it matters most.
 
 `gemm` (`minigrad/runtime/gemm.mojo`) is a Goto/BLIS-style kernel: pack
 blocks through the offset tables, accumulate 8 by 32 tiles of the output
-in vector registers with fused multiply-adds, split the longer side over
-threads. On the development machine (Ryzen 7 9800X3D, AVX-512) it runs
+in vector registers with fused multiply-adds, split the work over the
+thread pool (by columns where it can, so B is packed once). On the development machine (Ryzen 7 9800X3D, AVX-512) it runs
 at about 290 GFLOPS on one thread, close to the processor's peak.
+
+## Inference
+
+GPT-2 (`minigrad/llm/gpt2.mojo`) uses the same engine; three things
+were added for it.
+
+**Two eager operations.** `take_rows` looks up embeddings on the host:
+token ids are host integers anyway, and a lookup as one-hot times the
+table would be a 50,257-wide matrix product. `write_` copies new keys
+and values into each layer's cache, a `(max_context, 768)` tensor the
+layer owns. It is the only in-place write in the system, and it sits
+outside the lazy graph on purpose: the immutable-buffer argument above
+applies to values the graph shares, and a cache made by `Tensor.empty`
+is never shared (`write_` checks). Writing realizes the new keys and
+values, so a step is realized in a dozen pieces, one per layer.
+
+**Matrix-vector products.** At batch size one, a linear layer's
+contraction has no row dimension, so it was not recognized as a
+contraction and ran in the block executor at 5 to 9 GB/s. Contractions
+with only one side are now contractions, and `gemm` handles up to 16
+rows by streaming B once without packing it: a dot product per column
+when B's terms are contiguous (the output projection reads `wte`
+transposed), a scaled row per term when its columns are (Hugging Face
+stores GPT-2's linear layers as `(in, out)`). Columns are split over the
+pool. Every weight is then read at about 60 GB/s, this machine's memory
+bandwidth: 497 MB of float32 weights per token sets a floor of about 8
+ms per token, and a step takes about 10.7.
+
+**Batched products.** Attention multiplies per head: the head dimension
+is shared by both operands and the output. Such dimensions are now
+*batch* dimensions of a contraction, with their own offset tables, and
+the executor runs one `gemm` per batch index, spread over the pool when
+each is small. Before this, a 527-token prompt took 3.6 s (attention in
+the block executor at 1.4 GFLOPS); after, 0.19 s.
+
+**The thread pool** (`minigrad/runtime/pool.mojo`) replaced threads
+created per call, which cost about 50 µs each and made small products
+serial. Workers claim tasks with a compare-and-swap on a counter tagged
+with the job's generation; between jobs they spin for 2 ms, then sleep
+on a futex. Products split into several column chunks per thread, so a
+thread the system preempts delays only its chunk.
+
+**Lower-precision weights.** Decode reads every weight once per token,
+so storing them in fewer bytes is the largest lever left. There is no
+quantized-matmul kernel and no weight format: a weight stored as
+`float16`, `bfloat16`, or `int8` is an ordinary tensor, and `x.dot(w)`
+promotes `w` to `float32` with a `CAST` node. The scheduler recognizes a
+contraction operand that is a cast of a buffer and does not materialize
+the cast; the planner accepts `load, cast, mul` where it accepted
+`load, mul`, puts the converted operand in B, and records its stored
+type; `gemm`, given a second type parameter for B, converts as it packs
+B (tiled path) or streams it (matrix-vector path). The arithmetic is
+float32 throughout. For `int8`, `quantize_int8` keeps one scale per
+output, which factors out of the sum: `x.dot(q) * scale`, a contraction
+followed by an elementwise multiply. Scales that vary along the summed
+dimension (group-wise quantization, as llama.cpp uses for 4-bit
+weights) do not factor out and would need more than this.
+
+The cache's shapes grow with the context, so a decode step at a new
+length builds new plans for the attention kernels (about 8 per token,
+cheap, but the plan cache grows with every length seen). A fixed
+maximum length with a mask, as tinygrad uses, would fix the shapes; see
+`docs/plan.md`.
 
 ## What to read first
 

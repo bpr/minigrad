@@ -14,6 +14,15 @@ introduced.
   there is no way to update part of a buffer. Reason: nodes are
   hash-consed, so tensors with equal values share buffers.
 - **`+=`, `-=`, `*=`** rebind the tensor the same way.
+- **`write_(dim, start, value)` is the one in-place write**, eager and
+  outside the graph, for key-value caches; tinygrad writes caches with
+  `assign` into a slice (`cache[:, start:end].assign(x)`). The tensor
+  must own its buffer.
+- **`take_rows(ids)` is an eager, host-side embedding lookup** with a
+  list of ints; tinygrad's `Embedding` is lazy and differentiable.
+- **`scaled_dot_product_attention`'s `is_causal`** aligns the mask at the
+  end (query `i` sees keys up to `L - T + i`), so it is right for a
+  decoder with a cache; tinygrad's aligns it at the start.
 - **Reading `p.grad()` after `optimizer.step()`** recomputes the
   gradient from whatever of the graph is left, as in tinygrad; realize
   it before the step if it is needed afterwards.
@@ -74,7 +83,13 @@ introduced.
 - **Convolution has its own gradient rule** (a `CONV` marker node);
   tinygrad differentiates the operations it is built from.
 - **Element types**: `bool`, signed and unsigned integers of 8 to 64
-  bits, `float32`, `float64`. No `float16` or `bfloat16` yet.
+  bits, `float16`, `bfloat16`, `float32`, `float64`. Arithmetic on
+  16-bit floats is done in their own type, element by element, as in
+  tinygrad; their sums accumulate in `float32` and are converted back,
+  as in tinygrad. The fp8 types are absent.
+- **Quantization** is `nn.quantize_int8` (symmetric, per output) and a
+  multiply after the product; tinygrad's GGUF loader instead
+  dequantizes block formats in its graph.
 
 ## Engine
 
@@ -86,3 +101,8 @@ introduced.
 - **Reductions always get a buffer**; tinygrad can fuse elementwise work
   after a reduction into the same kernel.
 - **CPU only**, for now.
+- **The GPT-2 tokenizer is a hand-written matcher** for GPT-2's
+  pre-tokenizing regex. It is exact for ASCII and Latin-1 and agrees
+  with tiktoken on the test texts (including emoji and CJK), but it
+  classifies code points into letters, numbers, and others by block,
+  not from Unicode's tables, so rare scripts may split differently.

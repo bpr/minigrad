@@ -58,6 +58,7 @@ from minigrad.runtime.blockops import (
     where_block,
 )
 from minigrad.runtime.gemm import gemm, gemm_threads
+from minigrad.runtime.pool import run_parallel
 from minigrad.view import View, prod
 
 comptime K_LOAD = 100
@@ -238,12 +239,20 @@ struct Plan(Movable):
     var gemm_a: Int
     """The load that is operand A."""
     var gemm_b: Int
+    var gemm_bdt: DT
+    """How operand B is stored: the plan's type, or a narrower one that
+    gemm converts as it reads (bfloat16 weights, say)."""
     var ci: List[Int]
     var cj: List[Int]
     var ai: List[Int]
     var ak: List[Int]
     var bk: List[Int]
     var bj: List[Int]
+    var cb: List[Int]
+    """For a batch of contractions (dimensions shared by both operands
+    and the output), the offset of each one in C; `[0]` for one."""
+    var ab: List[Int]
+    var bb: List[Int]
 
     def __init__(out self, dtype: DT, reduce_op: Int, out_size: Int):
         self.sizes = List[Int]()
@@ -260,12 +269,16 @@ struct Plan(Movable):
         self.gemm = False
         self.gemm_a = 0
         self.gemm_b = 1
+        self.gemm_bdt = dtype
         self.ci = List[Int]()
         self.cj = List[Int]()
         self.ai = List[Int]()
         self.ak = List[Int]()
         self.bk = List[Int]()
         self.bj = List[Int]()
+        self.cb = List[Int]()
+        self.ab = List[Int]()
+        self.bb = List[Int]()
 
 
 def _offsets(
@@ -283,6 +296,50 @@ def _offsets(
                 next.append(out[i] + j * strides[g])
         out = next^
     return out^
+
+
+def _contraction_conversion(k: Kernel) -> Int:
+    """Whether `k` is a sum of the products of two loads, each perhaps
+    converted to the kernel's type on the way, that gemm can run.
+
+    Returns:
+        -2 if not; else the load gemm must convert (stored as `float16`,
+        `bfloat16`, or `int8`, in a `float32` kernel), or -1 for none.
+    """
+    if k.reduce_op != REDUCE_SUM or len(k.loads) != 2:
+        return -2
+    if k.dtype != DT.float32 and k.dtype != DT.float64:
+        return -2
+    if k.loads[0].view.has_mask() or k.loads[1].view.has_mask():
+        return -2
+    var n = len(k.instrs)
+    ref mul = k.instrs[n - 1]
+    if mul.op != OP_MUL:
+        return -2
+    var converted = -1
+    var seen = 0
+    for operand in [mul.a, mul.b]:
+        ref ins = k.instrs[operand]
+        if ins.op == K_LOAD:
+            if k.loads[ins.a].dtype != k.dtype:
+                return -2
+            seen |= 1 << ins.a
+        elif ins.op == OP_CAST and k.instrs[ins.a].op == K_LOAD:
+            var load = k.instrs[ins.a].a
+            var stored = k.loads[load].dtype
+            var ok = k.dtype == DT.float32 and (
+                stored.is_half() or stored == DT.int8
+            )
+            if not ok or converted >= 0:
+                return -2
+            converted = load
+            seen |= 1 << load
+        else:
+            return -2
+    # Both loads, and nothing but the loads, the casts, and the product.
+    if seen != 3 or n != 3 + (1 if converted >= 0 else 0):
+        return -2
+    return converted
 
 
 def make_plan(k: Kernel) -> Plan:
@@ -365,22 +422,12 @@ def make_plan(k: Kernel) -> Plan:
 
     # A sum of products of two loads, where each output dimension
     # belongs to one operand only, is a contraction: hand it to gemm.
-    if (
-        k.reduce_op == REDUCE_SUM
-        and (k.dtype == DT.float32 or k.dtype == DT.float64)
-        and nl == 2
-        and len(k.instrs) == 3
-        and k.instrs[0].op == K_LOAD
-        and k.instrs[1].op == K_LOAD
-        and k.instrs[2].op == OP_MUL
-        and k.instrs[2].a + k.instrs[2].b == 1
-        and not k.loads[0].view.has_mask()
-        and not k.loads[1].view.has_mask()
-    ):
+    var converted = _contraction_conversion(k)
+    if converted >= -1:
         var gi = List[Int]()
         var gj = List[Int]()
         var gk = List[Int]()
-        var ok = True
+        var gb = List[Int]()
         for g in range(ng):
             if gred[g]:
                 gk.append(g)
@@ -389,8 +436,8 @@ def make_plan(k: Kernel) -> Plan:
             elif lstride[0][g] == 0:
                 gj.append(g)
             else:
-                ok = False  # a dimension shared by both operands and C
-        if ok and len(gk) > 0 and len(gi) > 0 and len(gj) > 0:
+                gb.append(g)  # shared by both operands and C: a batch
+        if len(gk) > 0 and (len(gi) > 0 or len(gj) > 0):
             var a = 0
             var b = 1
             var ni = 1
@@ -399,8 +446,9 @@ def make_plan(k: Kernel) -> Plan:
                 ni *= gsize[g]
             for g in gj:
                 nj *= gsize[g]
-            if ni > nj:
-                # gemm vectorizes along j: make that the longer side.
+            # gemm converts operand B as it reads it; otherwise it
+            # vectorizes along j, so make that the longer side.
+            if converted == 0 or (converted < 0 and ni > nj):
                 a = 1
                 b = 0
                 var t = gi^
@@ -409,12 +457,16 @@ def make_plan(k: Kernel) -> Plan:
             plan.gemm = True
             plan.gemm_a = a
             plan.gemm_b = b
+            plan.gemm_bdt = k.loads[b].dtype
             plan.ci = _offsets(gi, gsize, gostride, 0)
             plan.cj = _offsets(gj, gsize, gostride, 0)
             plan.ai = _offsets(gi, gsize, lstride[a], k.loads[a].view.offset)
             plan.ak = _offsets(gk, gsize, lstride[a], 0)
             plan.bk = _offsets(gk, gsize, lstride[b], k.loads[b].view.offset)
             plan.bj = _offsets(gj, gsize, lstride[b], 0)
+            plan.cb = _offsets(gb, gsize, gostride, 0)
+            plan.ab = _offsets(gb, gsize, lstride[a], 0)
+            plan.bb = _offsets(gb, gsize, lstride[b], 0)
             return plan^
 
     # What to vectorize over. Either one dimension (a reduced one, or
@@ -689,6 +741,68 @@ def runtime() -> Pointer[Runtime, MutUntrackedOrigin]:
         abort("minigrad: cannot create the runtime")
 
 
+comptime GEMM_SPLIT_WORK = 4_000_000
+"""Multiply-adds of one product below which a batch of products is
+spread over threads by product rather than within each."""
+
+
+@fieldwise_init
+struct _Batch(Copyable):
+    """What a task of a batch of contractions needs: addresses of the
+    plan and the buffers."""
+
+    var plan: Int
+    var c: Int
+    var a: Int
+    var b: Int
+    var threads: Int
+
+
+def _batch_task(ctx: Int, i: Int):
+    """Contraction `i` of a batch."""
+    var job = Pointer[_Batch, MutUntrackedOrigin](unsafe_from_address=ctx)
+    var plan = Pointer[Plan, MutUntrackedOrigin](unsafe_from_address=job[].plan)
+    var isz = plan[].dtype.itemsize()
+    var c = BytePtr(unsafe_from_address=job[].c + plan[].cb[i] * isz)
+    var a = BytePtr(unsafe_from_address=job[].a + plan[].ab[i] * isz)
+    var bsz = plan[].gemm_bdt.itemsize()
+    var b = BytePtr(unsafe_from_address=job[].b + plan[].bb[i] * bsz)
+    if plan[].dtype == DT.float64:
+        _gemm[DType.float64, DType.float64](c, a, b, plan, job[].threads)
+    elif plan[].gemm_bdt == DT.float16:
+        _gemm[DType.float32, DType.float16](c, a, b, plan, job[].threads)
+    elif plan[].gemm_bdt == DT.bfloat16:
+        _gemm[DType.float32, DType.bfloat16](c, a, b, plan, job[].threads)
+    elif plan[].gemm_bdt == DT.int8:
+        _gemm[DType.float32, DType.int8](c, a, b, plan, job[].threads)
+    else:
+        _gemm[DType.float32, DType.float32](c, a, b, plan, job[].threads)
+
+
+@always_inline
+def _gemm[
+    dt: DType, bdt: DType
+](
+    c: BytePtr,
+    a: BytePtr,
+    b: BytePtr,
+    plan: Pointer[Plan, MutUntrackedOrigin],
+    threads: Int,
+):
+    gemm[dt, bdt](
+        c,
+        plan[].ci,
+        plan[].cj,
+        a,
+        plan[].ai,
+        plan[].ak,
+        b,
+        plan[].bk,
+        plan[].bj,
+        threads,
+    )
+
+
 def run_plan(
     plan: Plan, out_ptr: BytePtr, ins: List[BytePtr], instrs: List[Instr]
 ):
@@ -705,32 +819,24 @@ def run_plan(
     var rt = runtime()
     if plan.gemm:
         unsafe_memset_zero(out_ptr, plan.out_size * plan.dtype.itemsize())
-        if plan.dtype == DT.float32:
-            gemm[DType.float32](
-                out_ptr,
-                plan.ci,
-                plan.cj,
-                ins[plan.gemm_a],
-                plan.ai,
-                plan.ak,
-                ins[plan.gemm_b],
-                plan.bk,
-                plan.bj,
-                rt[].threads,
-            )
+        var batch = _Batch(
+            Int(Pointer(to=plan)),
+            Int(out_ptr),
+            Int(ins[plan.gemm_a]),
+            Int(ins[plan.gemm_b]),
+            rt[].threads,
+        )
+        var nb = len(plan.cb)
+        var work = len(plan.ci) * len(plan.cj) * len(plan.ak)
+        if nb > 1 and work < GEMM_SPLIT_WORK:
+            # Many small products: one per task, each on one thread.
+            batch.threads = 1
+            run_parallel[_batch_task](Int(Pointer(to=batch)), nb)
         else:
-            gemm[DType.float64](
-                out_ptr,
-                plan.ci,
-                plan.cj,
-                ins[plan.gemm_a],
-                plan.ai,
-                plan.ak,
-                ins[plan.gemm_b],
-                plan.bk,
-                plan.bj,
-                rt[].threads,
-            )
+            for b in range(nb):
+                _batch_task(Int(Pointer(to=batch)), b)
+        # Tasks read `batch` through an address: keep it alive until here.
+        _ = batch^
         return
     rt[].reserve(plan.nslots)
     var scratch = rt[].scratch

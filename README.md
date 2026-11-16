@@ -49,21 +49,36 @@ Early. What works, on CPU:
   comparisons, `where`, reductions, reshape/permute/expand/pad/shrink/
   flip, `cat`/`stack`, matmul, convolution (stride, dilation, groups,
   padding), pooling, softmax, cross-entropy, layer and batch
-  normalization; eleven element types.
+  normalization, attention; thirteen element types, `float16` and
+  `bfloat16` among them.
 - **Gradients** of all of the above, including second derivatives.
 - **`minigrad.nn`**: `Linear`, `Conv2d`, `BatchNorm`, `LayerNorm`; `SGD`,
   `Adam`, `AdamW`.
 - **MNIST**: `examples/mnist.mojo` trains tinygrad's `beautiful_mnist`
-  model to 97.9% test accuracy in 70 steps and 14 seconds.
+  model to 97.9% test accuracy in 70 steps.
+- **GPT-2 inference**: `examples/gpt2.mojo` loads Hugging Face's
+  safetensors weights, tokenizes with GPT-2's BPE, and generates with a
+  key-value cache. Its greedy output matches tinygrad's token for token,
+  its logits agree to 2e-4, and its tokenizer agrees with tiktoken.
 
-What does not exist yet: a GPU backend, Python bindings, indexing with
-slices and index tensors, embeddings, and everything a transformer
-needs beyond matmul. `docs/plan.md` has the order of work.
+- **Lower-precision weights**: GPT-2's matrices can be stored as
+  `float16`, `bfloat16`, or `int8` (one scale per output) and are
+  converted as the matrix-multiply kernel reads them. 16-bit weights
+  halve decode time with no measurable loss; int8 cuts it by about 55%
+  for about 4% higher perplexity.
 
-Measured against tinygrad's CPU backend on one machine, a training step
-is 5 to 22 times faster than under `TinyJit` and 30 to 100 times faster
-than without it; `benchmarks/README.md` has the tables, how to
-reproduce them, and what they do not show.
+What does not exist yet: a GPU backend, Python bindings, batched
+generation, group-wise or 4-bit quantization, indexing with slices and
+index tensors, and models beyond GPT-2. `docs/plan.md` has the order of
+work.
+
+Measured against tinygrad's CPU backend on one machine, GPT-2 decodes
+at 10 ms per token with float32 weights against tinygrad's 122 ms (close
+to the floor that reading 497 MB of weights per token sets), 5.8 ms with
+16-bit weights, and 4.3 ms with int8; a training step is 7.6 to 15 times
+faster than under `TinyJit`. These are single runs on a busy machine.
+`benchmarks/README.md` has the tables, how to reproduce them, and what
+they do not show.
 
 ## Getting started
 
@@ -71,11 +86,18 @@ minigrad needs [pixi](https://pixi.sh) and Linux on x86-64.
 
 ```sh
 pixi install
-pixi run test                                  # 88 tests, about half a minute
+pixi run test                                  # 105 tests, about a minute
 
 bash examples/get_mnist.sh                     # 55 MB into data/mnist/
 pixi run mojo run -I . examples/mnist.mojo     # 70 steps, batch 512
+
+bash examples/get_gpt2.sh                      # 550 MB into data/gpt2/
+pixi run mojo run -I . examples/gpt2.mojo --prompt "Hello." --count 40
 ```
+
+`examples/gpt2.mojo` takes `--temperature` (0 for greedy; default 0.8),
+`--top_k`, `--seed`, `--timing`, and `--dtype` (`float32`, `float16`,
+`bfloat16`, `int8`).
 
 Programs import the package from the source tree with `-I .`. Set
 `MINIGRAD_DEBUG=2` to print every kernel as it runs:

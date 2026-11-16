@@ -3,7 +3,16 @@
 from std.testing import TestSuite, assert_equal, assert_true, assert_false
 
 from minigrad.graph import graph
-from minigrad.nn import Linear, LayerNorm, SGD, Adam, AdamW, collect
+from minigrad.nn import (
+    Linear,
+    LayerNorm,
+    SGD,
+    Adam,
+    AdamW,
+    collect,
+    quantize_int8,
+)
+from minigrad.dtype import DT
 from minigrad.tensor import Tensor
 from helpers import assert_close, assert_shape
 
@@ -178,6 +187,23 @@ def test_adam_reuses_plans() raises:
             plans.append(graph()[].stats.kernels_compiled)
     assert_equal(plans[1], plans[0])
     assert_true(losses[11] < losses[0])
+
+
+def test_quantize_int8() raises:
+    Tensor.manual_seed(5)
+    var w = Tensor.randn(64, 10) * Tensor.arange(1, 11).float()
+    var qs = quantize_int8(w, 1)
+    assert_equal(qs.q.dtype(), DT.int8)
+    assert_equal(qs.scale.shape(), [1, 10])
+    # Each column's largest magnitude maps to 127, and the error is at
+    # most half a step.
+    assert_close(qs.q.float().abs().max(0), List[Float64](length=10, fill=127))
+    var err = (qs.q.float() * qs.scale - w).abs().max(0).tolist()
+    var step = qs.scale.tolist()
+    for j in range(10):
+        assert_true(err[j] <= 0.5 * step[j] + 1e-6)
+    var zero = quantize_int8(Tensor.zeros(3, 2), 0)
+    assert_close(zero.q, [0, 0, 0, 0, 0, 0])
 
 
 def test_layernorm_layer() raises:

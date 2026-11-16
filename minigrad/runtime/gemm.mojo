@@ -16,17 +16,20 @@ shaped like a contraction.
 The implementation is the classic blocking of Goto and BLIS: blocks of
 the operands are packed into contiguous panels through the tables, sized
 to stay in cache, and a microkernel accumulates an `MR` by `NR` tile of C
-in vector registers. Columns of C are independent, so `gemm` splits them
-over threads; each thread packs its own blocks.
+in vector registers. Rows and columns of C are independent, so `gemm`
+splits the longer side over the thread pool; each thread packs its own
+blocks. Up to `GEMV_ROWS` rows, `gemm` instead streams B once, without
+packing it: a matrix-vector product is limited by memory, not
+arithmetic.
 """
 
-from std.ffi import external_call
 from std.os import getenv
 from std.memory import unsafe_memset_zero
 from std.memory.alloc import unsafe_alloc
 from std.sys import num_physical_cores, simd_width_of, size_of
 
 from minigrad.graph import BytePtr
+from minigrad.runtime.pool import run_parallel
 
 comptime MR = 8
 """Rows of C per microkernel tile."""
@@ -40,10 +43,9 @@ comptime NC_VECTORS = 256
 """SIMD vectors of C columns per packed B block: with `KC` terms, about
 4 MB of packed B per thread."""
 
-comptime PARALLEL_WORK = 32_000_000
-"""Multiply-adds below which `gemm` stays on the calling thread: about a
-quarter of a millisecond of work, several times what starting the
-threads costs."""
+comptime PARALLEL_WORK = 2_000_000
+"""Multiply-adds below which `gemm` stays on the calling thread (about
+10 microseconds of work)."""
 
 
 @always_inline
@@ -135,8 +137,9 @@ struct _Job(Copyable):
     var j_hi: Int
 
 
-def _block[dt: DType](job: _Job):
-    """Adds the contraction into the job's rows and columns of C."""
+def _block[dt: DType, bdt: DType](job: _Job):
+    """Adds the contraction into the job's rows and columns of C. B is
+    stored as `bdt` and converted to `dt` as it is packed."""
     comptime W = simd_width_of[dt]()
     comptime NR = NV * W
     comptime NC = NC_VECTORS * W
@@ -145,7 +148,7 @@ def _block[dt: DType](job: _Job):
     var nk = job.nk
     var c = P(unsafe_from_address=job.c)
     var a = P(unsafe_from_address=job.a)
-    var b = P(unsafe_from_address=job.b)
+    var b = Pointer[Scalar[bdt], MutUntrackedOrigin](unsafe_from_address=job.b)
     var ci = _IntPtr(unsafe_from_address=job.ci)
     var cj = _IntPtr(unsafe_from_address=job.cj)
     var ai = _IntPtr(unsafe_from_address=job.ai)
@@ -185,7 +188,9 @@ def _block[dt: DType](job: _Job):
                         comptime for v in range(NV):
                             d.unsafe_store(
                                 v * W,
-                                src.unsafe_load[width=W, alignment=1](v * W),
+                                src.unsafe_load[width=W, alignment=1](
+                                    v * W
+                                ).cast[dt](),
                             )
                 else:
                     if nr < NR:
@@ -196,7 +201,7 @@ def _block[dt: DType](job: _Job):
                         for j in range(nr):
                             d[unsafe_offset=j] = row[
                                 unsafe_offset=bj[unsafe_offset=j0 + j]
-                            ]
+                            ].cast[dt]()
             # When the terms are consecutive in A, its rows are read in
             # place; otherwise blocks of A are packed like B.
             var ak_unit = _is_unit(ak, kc)
@@ -292,12 +297,205 @@ def _block[dt: DType](job: _Job):
     edge.unsafe_free()
 
 
-def _thread_entry[
-    dt: DType
-](arg: OpaquePointer[MutAnyOrigin]) -> OpaquePointer[MutAnyOrigin]:
-    """The entry point of a worker thread: runs the job at `arg`."""
-    _block[dt](arg.unsafe_bitcast[_Job]()[])
-    return arg
+def _block_task[dt: DType, bdt: DType](ctx: Int, i: Int):
+    """Pool task `i`: job `i` of the array at `ctx`."""
+    var jobs = Pointer[_Job, MutUntrackedOrigin](unsafe_from_address=ctx)
+    _block[dt, bdt](jobs[unsafe_offset=i])
+
+
+comptime GEMV_PARALLEL_WORK = 1_000_000
+"""Multiply-adds from which a matrix-vector product uses threads."""
+
+comptime GEMV_ROWS = 16
+"""Rows of C up to which `gemm` streams B once instead of tiling."""
+
+comptime CHUNKS_PER_THREAD = 4
+"""Pieces a product splits into per thread, when splitting is free."""
+
+
+@always_inline
+def _dot[
+    dt: DType, bdt: DType
+](
+    x: Pointer[Scalar[dt], MutUntrackedOrigin],
+    y: Pointer[Scalar[bdt], MutUntrackedOrigin],
+    n: Int,
+) -> Scalar[dt]:
+    """`sum(x[k] * y[k])` over `n` contiguous elements, `y` converted
+    from `bdt`."""
+    comptime W = simd_width_of[dt]()
+    var a0 = SIMD[dt, W](0)
+    var a1 = SIMD[dt, W](0)
+    var a2 = SIMD[dt, W](0)
+    var a3 = SIMD[dt, W](0)
+    var k = 0
+    while k + 4 * W <= n:
+        a0 = x.unsafe_load[width=W, alignment=1](k).fma(
+            y.unsafe_load[width=W, alignment=1](k).cast[dt](), a0
+        )
+        a1 = x.unsafe_load[width=W, alignment=1](k + W).fma(
+            y.unsafe_load[width=W, alignment=1](k + W).cast[dt](), a1
+        )
+        a2 = x.unsafe_load[width=W, alignment=1](k + 2 * W).fma(
+            y.unsafe_load[width=W, alignment=1](k + 2 * W).cast[dt](), a2
+        )
+        a3 = x.unsafe_load[width=W, alignment=1](k + 3 * W).fma(
+            y.unsafe_load[width=W, alignment=1](k + 3 * W).cast[dt](), a3
+        )
+        k += 4 * W
+    while k + W <= n:
+        a0 = x.unsafe_load[width=W, alignment=1](k).fma(
+            y.unsafe_load[width=W, alignment=1](k).cast[dt](), a0
+        )
+        k += W
+    var s = ((a0 + a1) + (a2 + a3)).reduce_add()
+    while k < n:
+        s += x[unsafe_offset=k] * y[unsafe_offset=k].cast[dt]()
+        k += 1
+    return s
+
+
+def _gemv[dt: DType, bdt: DType](job: _Job):
+    """Columns `[j_lo, j_hi)` of C for a few rows, reading B once.
+
+    `job.a` is A packed: `ni` rows of `nk` contiguous elements. B is read
+    by columns when its terms are contiguous (a dot product per column),
+    by rows when its columns are (a scaled row added per term), and
+    element by element otherwise.
+    """
+    comptime W = simd_width_of[dt]()
+    comptime P = Pointer[Scalar[dt], MutUntrackedOrigin]
+    var ni = job.i_hi - job.i_lo
+    var nk = job.nk
+    var c = P(unsafe_from_address=job.c)
+    var a = P(unsafe_from_address=job.a)
+    var b = Pointer[Scalar[bdt], MutUntrackedOrigin](unsafe_from_address=job.b)
+    var ci = _IntPtr(unsafe_from_address=job.ci)
+    var cj = _IntPtr(unsafe_from_address=job.cj)
+    var bk = _IntPtr(unsafe_from_address=job.bk)
+    var bj = _IntPtr(unsafe_from_address=job.bj)
+    var nj = job.j_hi - job.j_lo
+    var bj_lo = bj.unsafe_offset(job.j_lo)
+    var cj_lo = cj.unsafe_offset(job.j_lo)
+    if _is_unit(bk, nk):
+        var k0 = bk[unsafe_offset=0]
+        for j in range(nj):
+            var col = b.unsafe_offset(k0 + bj_lo[unsafe_offset=j])
+            for i in range(ni):
+                c[
+                    unsafe_offset=ci[unsafe_offset=i] + cj_lo[unsafe_offset=j]
+                ] += _dot[dt, bdt](a.unsafe_offset(i * nk), col, nk)
+        return
+    if _is_unit(bj_lo, nj):
+        var acc = unsafe_alloc[Scalar[dt]](ni * nj + 2 * W, alignment=64)
+        unsafe_memset_zero(acc, ni * nj + 2 * W)
+        var j0 = bj_lo[unsafe_offset=0]
+        for k in range(nk):
+            var row = b.unsafe_offset(bk[unsafe_offset=k] + j0)
+            for i in range(ni):
+                var s = SIMD[dt, W](a[unsafe_offset=i * nk + k])
+                var dst = acc.unsafe_offset(i * nj)
+                var j = 0
+                while j + W <= nj:
+                    dst.unsafe_store(
+                        j,
+                        s.fma(
+                            row.unsafe_load[width=W, alignment=1](j).cast[dt](),
+                            dst.unsafe_load[width=W, alignment=1](j),
+                        ),
+                    )
+                    j += W
+                while j < nj:
+                    dst[unsafe_offset=j] += (
+                        s[0] * row[unsafe_offset=j].cast[dt]()
+                    )
+                    j += 1
+        for i in range(ni):
+            var crow = c.unsafe_offset(ci[unsafe_offset=i])
+            for j in range(nj):
+                crow[unsafe_offset=cj_lo[unsafe_offset=j]] += acc[
+                    unsafe_offset=i * nj + j
+                ]
+        acc.unsafe_free()
+        return
+    for i in range(ni):
+        var crow = c.unsafe_offset(ci[unsafe_offset=i])
+        var arow = a.unsafe_offset(i * nk)
+        for j in range(nj):
+            var s = Scalar[dt](0)
+            var base = b.unsafe_offset(bj_lo[unsafe_offset=j])
+            for k in range(nk):
+                s += (
+                    arow[unsafe_offset=k]
+                    * base[unsafe_offset=bk[unsafe_offset=k]].cast[dt]()
+                )
+            crow[unsafe_offset=cj_lo[unsafe_offset=j]] += s
+
+
+def _gemv_task[dt: DType, bdt: DType](ctx: Int, i: Int):
+    """Pool task `i`: job `i` of the array at `ctx`."""
+    var jobs = Pointer[_Job, MutUntrackedOrigin](unsafe_from_address=ctx)
+    _gemv[dt, bdt](jobs[unsafe_offset=i])
+
+
+def _gemv_all[
+    dt: DType, bdt: DType
+](
+    c: BytePtr,
+    ci: List[Int],
+    cj: List[Int],
+    a: BytePtr,
+    ai: List[Int],
+    ak: List[Int],
+    b: BytePtr,
+    bk: List[Int],
+    bj: List[Int],
+    threads: Int,
+):
+    """`gemm` for at most `GEMV_ROWS` rows: packs A, then splits the
+    columns over the pool, each thread streaming its share of B once."""
+    comptime W = simd_width_of[dt]()
+    var ni = len(ci)
+    var nj = len(cj)
+    var nk = len(ak)
+    var pa = a.unsafe_bitcast[Scalar[dt]]()
+    var apack = unsafe_alloc[Scalar[dt]](ni * nk + W, alignment=64)
+    for i in range(ni):
+        var row = pa.unsafe_offset(ai[i])
+        for k in range(nk):
+            apack[unsafe_offset=i * nk + k] = row[unsafe_offset=ak[k]]
+    var workers = 1
+    if threads > 1 and ni * nj * nk >= GEMV_PARALLEL_WORK:
+        workers = max(1, min(CHUNKS_PER_THREAD * threads, nj // (4 * W)))
+    var jobs = List[_Job](capacity=workers)
+    for w in range(workers):
+        # Column ranges in whole vectors, so threads write whole lines.
+        var lo = (nj * w // workers) // W * W
+        var hi = nj if w == workers - 1 else (
+            (nj * (w + 1) // workers) // W * W
+        )
+        jobs.append(
+            _Job(
+                Int(c),
+                Int(apack),
+                Int(b),
+                Int(ci.unsafe_ptr()),
+                Int(cj.unsafe_ptr()),
+                Int(apack),
+                Int(ak.unsafe_ptr()),
+                Int(bk.unsafe_ptr()),
+                Int(bj.unsafe_ptr()),
+                nk,
+                0,
+                ni,
+                lo,
+                hi,
+            )
+        )
+    run_parallel[_gemv_task[dt, bdt]](Int(jobs.unsafe_ptr()), workers)
+    # The tasks read `jobs` through an address: keep it alive until here.
+    _ = jobs^
+    apack.unsafe_free()
 
 
 def gemm_threads() -> Int:
@@ -315,7 +513,7 @@ def gemm_threads() -> Int:
 
 
 def gemm[
-    dt: DType
+    dt: DType, bdt: DType = dt
 ](
     c: BytePtr,
     ci: List[Int],
@@ -329,6 +527,9 @@ def gemm[
     threads: Int,
 ):
     """Adds a contraction of A and B into C; see the module docstring.
+
+    B may be stored in a narrower type `bdt` (16-bit floats, `int8`): it
+    is converted to `dt` as it is read, never copied whole.
 
     The microkernel vectorizes along the columns `j`: callers should
     make J the longer side. Threads split whichever of the rows and
@@ -353,14 +554,28 @@ def gemm[
     var nk = len(ak)
     if ni == 0 or nj == 0 or nk == 0:
         return
+    if ni <= GEMV_ROWS:
+        _gemv_all[dt, bdt](c, ci, cj, a, ai, ak, b, bk, bj, threads)
+        return
     var itiles = ni // MR
     var jtiles = nj // NR
-    var by_rows = itiles > jtiles
+    # Each thread packs the B columns it computes, so splitting by
+    # columns packs B once; split by rows only when there are too few
+    # column tiles to go round.
+    var by_rows = jtiles < min(threads, itiles)
+    # Chunks of whole tiles, claimed by the pool's threads as they come
+    # free: by columns, several per thread, so a thread the system
+    # preempts holds up only a small share; by rows, one per thread, as
+    # each row chunk packs all of B.
     var workers = 1
-    if ni * nj * nk >= PARALLEL_WORK:
-        workers = max(1, min(threads, itiles if by_rows else jtiles))
+    # `threads == 1` means this call is itself a pool task: run_parallel
+    # is not reentrant, so it must stay one chunk.
+    if threads > 1 and ni * nj * nk >= PARALLEL_WORK:
+        if by_rows:
+            workers = max(1, min(threads, itiles))
+        else:
+            workers = max(1, min(CHUNKS_PER_THREAD * threads, jtiles))
     var jobs = List[_Job](capacity=workers)
-    var tids = List[UInt64](length=workers, fill=0)
     for w in range(workers):
         # Whole tiles per thread, so no two threads share an element.
         var i_lo = 0
@@ -393,17 +608,6 @@ def gemm[
                 j_hi,
             )
         )
-    if workers == 1:
-        _block[dt](jobs[0])
-    else:
-        var entry = _thread_entry[dt]
-        for w in range(1, workers):
-            _ = external_call["pthread_create", Int32](
-                Pointer(to=tids[w]),
-                Int(0),
-                entry,
-                Pointer(to=jobs[w]).unsafe_bitcast[NoneType](),
-            )
-        _block[dt](jobs[0])
-        for w in range(1, workers):
-            _ = external_call["pthread_join", Int32](tids[w], Int(0))
+    run_parallel[_block_task[dt, bdt]](Int(jobs.unsafe_ptr()), workers)
+    # The tasks read `jobs` through an address: keep it alive until here.
+    _ = jobs^

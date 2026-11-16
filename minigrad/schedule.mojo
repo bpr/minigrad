@@ -32,6 +32,7 @@ from minigrad.graph import (
     is_binary,
     is_movement,
     OP_BUFFER,
+    OP_CAST,
     OP_CONST,
     OP_CONTIGUOUS,
     OP_CONV,
@@ -116,7 +117,7 @@ struct _Scheduler(Movable):
                 self.is_root[i] = True
         # A sum of products whose operands each skip an output dimension
         # is a contraction: give both operands buffers, so the kernel is
-        # two loads and the tuned gemm can run it.
+        # two loads (each perhaps converted) and the tuned gemm can run it.
         for i in range(n):
             var node = self.order[i]
             if g[].nodes[node].op != OP_REDUCE or (
@@ -132,6 +133,14 @@ struct _Scheduler(Movable):
                 var s = g[].nodes[m].s0 if j == 0 else g[].nodes[m].s1
                 while is_movement(g[].nodes[s].op):
                     s = g[].nodes[s].s0
+                if g[].nodes[s].op == OP_CAST:
+                    # A buffer stored in another type (bfloat16 weights,
+                    # say) stays as it is: gemm converts as it reads.
+                    var t = g[].nodes[s].s0
+                    while is_movement(g[].nodes[t].op):
+                        t = g[].nodes[t].s0
+                    if g[].nodes[t].op == OP_BUFFER:
+                        continue
                 var sop = g[].nodes[s].op
                 if sop != OP_BUFFER and sop != OP_CONST:
                     self.is_root[g[].pos[s]] = True
@@ -194,8 +203,10 @@ struct _Scheduler(Movable):
 
     def _is_contraction(self, reduce: Int, mul: Int) -> Bool:
         """Whether `reduce`, a sum of the product `mul`, has the shape
-        `C[i,j] = sum_k A[i,k] B[k,j]`: every output dimension is
-        broadcast in exactly one operand, and both kinds occur."""
+        `C[b,i,j] = sum_k A[b,i,k] B[b,k,j]`: some output dimension is
+        broadcast in exactly one operand. With a single row (`i` empty)
+        it is a matrix-vector product; dimensions neither operand
+        broadcasts (`b`) make a batch of products."""
         var g = graph()
         var bx = self._broadcast_dims(g[].nodes[mul].s0)
         var by = self._broadcast_dims(g[].nodes[mul].s1)
@@ -212,9 +223,8 @@ struct _Scheduler(Movable):
                 only_y = True
             elif by[d] and not bx[d]:
                 only_x = True
-            elif not bx[d] and not by[d]:
-                return False
-        return only_x and only_y
+        # Dimensions neither operand broadcasts are a batch of products.
+        return only_x or only_y
 
     def _chain(mut self, parent: Int, node: Int) -> Int:
         """The chain that applies movement `node`, then chain `parent`."""

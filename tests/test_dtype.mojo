@@ -1,6 +1,6 @@
 from std.testing import TestSuite, assert_equal, assert_true, assert_false
 
-from minigrad.dtype import DT, promote, sum_acc_dtype
+from minigrad.dtype import DT, parse_dtype, promote, sum_acc_dtype
 
 
 def test_itemsize() raises:
@@ -34,6 +34,21 @@ def test_names() raises:
     assert_equal(sum_acc_dtype(DT.bool), DT.int32)
     assert_equal(sum_acc_dtype(DT.uint8), DT.uint32)
     assert_equal(sum_acc_dtype(DT.float32), DT.float32)
+
+
+def test_half() raises:
+    assert_equal(DT.float16.itemsize(), 2)
+    assert_equal(DT.bfloat16.itemsize(), 2)
+    assert_true(DT.bfloat16.is_float() and DT.bfloat16.is_half())
+    assert_false(DT.float32.is_half())
+    assert_equal(promote(DT.float16, DT.bfloat16), DT.float32)
+    assert_equal(promote(DT.float16, DT.float32), DT.float32)
+    assert_equal(promote(DT.bfloat16, DT.int32), DT.bfloat16)
+    assert_equal(promote(DT.float16, DT.float64), DT.float64)
+    assert_equal(sum_acc_dtype(DT.float16), DT.float32)
+    assert_equal(parse_dtype("bfloat16"), DT.bfloat16)
+    for c in range(DT.COUNT):
+        assert_equal(parse_dtype(DT(c).name()), DT(c))
 
 
 def main() raises:

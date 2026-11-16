@@ -80,6 +80,10 @@ def mojo_dtype(code: Int) -> DType:
     if code == 8:
         return DType.uint64
     if code == 9:
+        return DType.float16
+    if code == 10:
+        return DType.bfloat16
+    if code == 11:
         return DType.float32
     return DType.float64
 

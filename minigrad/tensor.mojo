@@ -13,7 +13,8 @@ and semantics.
 """
 
 from std.math import cos, log, pi, sqrt
-from std.memory import ArcPointer
+from std.memory import ArcPointer, unsafe_memcpy
+from std.utils.numerics import inf
 
 from minigrad.dtype import DT, promote, sum_acc_dtype
 from minigrad.gradient import compute_gradients
@@ -421,6 +422,106 @@ struct Tensor(ImplicitlyCopyable, Writable):
         if u.op() != OP_BUFFER:
             raise Error("data_ptr() of a view; call contiguous() first")
         return graph()[].buffer_ptr(u.id)
+
+    # ---- eager operations (outside the lazy graph)
+
+    def take_rows(self, rows: List[Int]) raises -> Tensor:
+        """The given indices of dimension 0, gathered now: an embedding
+        lookup.
+
+        This tensor is realized first. The result is a new realized
+        tensor; it is not differentiable with respect to this one.
+
+        Args:
+            rows: Indices into dimension 0, each in range.
+
+        Returns:
+            A tensor of shape `(len(rows), shape[1:]...)`.
+
+        Raises:
+            If an index is out of range.
+        """
+        var u = self._contiguous_uop()
+        var shape = u.shape()
+        if len(shape) == 0:
+            raise Error("take_rows() of a scalar")
+        var row_bytes = u.size() // max(shape[0], 1) * u.dtype().itemsize()
+        var out_shape = shape.copy()
+        out_shape[0] = len(rows)
+        var out = UOp.new_buffer(u.dtype(), out_shape)
+        var g = graph()
+        var src = g[].buffer_ptr(u.id)
+        var dst = g[].buffer_ptr(out.id)
+        for i in range(len(rows)):
+            var r = rows[i]
+            if r < 0 or r >= shape[0]:
+                raise Error(t"take_rows(): index {r} out of range for {shape}")
+            unsafe_memcpy(
+                dest=dst.unsafe_offset(i * row_bytes),
+                src=src.unsafe_offset(r * row_bytes),
+                count=row_bytes,
+            )
+        return Tensor(out)
+
+    def write_(self, dim: Int, start: Int, value: Tensor) raises:
+        """Overwrites indices `[start, start + n)` of dimension `dim` with
+        `value`, now.
+
+        This is the one operation that changes memory in place, for
+        state such as a key-value cache. The tensor must own its buffer:
+        make it with `Tensor.empty` (or `zeros(...).contiguous()` and
+        `realize()`). Views of it (slices, reshapes, ...) share its
+        memory and see the new values; so do lazy tensors computed from
+        it that are realized afterwards. Take a copy with
+        `contiguous().realize()` to keep the old values.
+
+        Args:
+            dim: The dimension to write along.
+            start: The first index written.
+            value: The new elements: this tensor's shape, with `n` in
+                dimension `dim`. It is realized and converted to this
+                tensor's element type.
+
+        Raises:
+            If the tensor does not own a buffer, or the shapes do not
+            fit.
+        """
+        var g = graph()
+        var u = self.uop()
+        if u.op() != OP_BUFFER:
+            raise Error("write_() needs a realized tensor with its own buffer")
+        var buffer = g[].nodes[u.id].arg[0]
+        if g[].buffers[buffer].rc != 1:
+            raise Error("write_() on a buffer shared with another tensor")
+        var d = self._axis(dim)
+        var shape = u.shape()
+        var vshape = value.shape()
+        if len(vshape) != len(shape):
+            raise Error(t"write_() of shape {vshape} into {shape}")
+        for i in range(len(shape)):
+            if i != d and vshape[i] != shape[i]:
+                raise Error(t"write_() of shape {vshape} into {shape}")
+        var n = vshape[d]
+        if start < 0 or start + n > shape[d]:
+            raise Error(
+                t"write_() of {n} indices at {start} into a dimension of"
+                t" {shape[d]}"
+            )
+        var v = value.cast(u.dtype())._contiguous_uop()
+        var outer = 1
+        for i in range(d):
+            outer *= shape[i]
+        var inner = u.dtype().itemsize()
+        for i in range(d + 1, len(shape)):
+            inner *= shape[i]
+        var src = g[].buffer_ptr(v.id)
+        var dst = g[].buffer_ptr(u.id)
+        for o in range(outer):
+            unsafe_memcpy(
+                dest=dst.unsafe_offset((o * shape[d] + start) * inner),
+                src=src.unsafe_offset(o * n * inner),
+                count=n * inner,
+            )
 
     def to_string(self) raises -> String:
         """The elements as nested brackets, realizing the tensor."""
@@ -906,6 +1007,10 @@ struct Tensor(ImplicitlyCopyable, Writable):
         """Converts the elements to `float32`."""
         return self.cast(DT.float32)
 
+    def half(self) -> Tensor:
+        """Converts the elements to `float16`."""
+        return self.cast(DT.float16)
+
     def int(self) -> Tensor:
         """Converts the elements to `int32`, truncating."""
         return self.cast(DT.int32)
@@ -954,6 +1059,24 @@ struct Tensor(ImplicitlyCopyable, Writable):
             return self
         var b = self.trunc()
         return self.lt(b).where(b - 1.0, b)
+
+    def round(self) raises -> Tensor:
+        """Rounds every element to the nearest integer, ties to even."""
+        if not self.dtype().is_float():
+            return self
+        var b = self.floor()
+        var d = self - b
+        var odd = (b - (b * 0.5).floor() * 2.0).ne(0.0)
+        var up = d.gt(0.5).logical_or(d.eq(0.5).logical_and(odd))
+        return up.where(b + 1.0, b)
+
+    def logical_and(self, other: Tensor) raises -> Tensor:
+        """Elementwise `and` of truth values."""
+        return Tensor(self.bool().uop().alu2(OP_AND, other.bool().uop()))
+
+    def logical_or(self, other: Tensor) raises -> Tensor:
+        """Elementwise `or` of truth values."""
+        return Tensor(self.bool().uop().alu2(OP_OR, other.bool().uop()))
 
     def ceil(self) raises -> Tensor:
         """Rounds every element up."""
@@ -1262,9 +1385,13 @@ struct Tensor(ImplicitlyCopyable, Writable):
 
     def sum(self, *axis: Int, keepdim: Bool = False) raises -> Tensor:
         """The sum over the given dimensions (all when none are given).
-        Narrow integers and booleans are summed as 32-bit integers."""
+        Narrow integers and booleans are summed as 32-bit integers, and
+        16-bit floats in `float32` and converted back, as in tinygrad."""
         var x = self.cast(sum_acc_dtype(self.dtype()))
-        return x._reduce(REDUCE_SUM, _list(axis), keepdim)
+        var s = x._reduce(REDUCE_SUM, _list(axis), keepdim)
+        if self.dtype().is_half():
+            return s.cast(self.dtype())
+        return s
 
     def max(self, *axis: Int, keepdim: Bool = False) raises -> Tensor:
         """The maximum over the given dimensions (all when none)."""
@@ -1603,6 +1730,72 @@ struct Tensor(ImplicitlyCopyable, Writable):
         shape[1] = self.shape()[1]
         var x = self - mean.reshape(shape)
         return x * (weight * invstd).reshape(shape) + bias.reshape(shape)
+
+    # ---- attention
+
+    def scaled_dot_product_attention(
+        self,
+        key: Tensor,
+        value: Tensor,
+        attn_mask: Optional[Tensor] = None,
+        is_causal: Bool = False,
+    ) raises -> Tensor:
+        """`softmax(self @ key.T / sqrt(d) + mask) @ value`, over the last
+        two dimensions.
+
+        Args:
+            key: Keys, `(..., L, d)`.
+            value: Values, `(..., L, dv)`.
+            attn_mask: A `bool` tensor (true where a query may attend to
+                a key) or a float tensor added to the scores; broadcast
+                to `(..., T, L)`.
+            is_causal: Whether query `i` attends only to keys up to
+                `i`, aligned at the end (`L - T + i`), as in a decoder
+                with a cache.
+
+        Returns:
+            `(..., T, dv)`.
+        """
+        var d = self.shape()[self.ndim() - 1]
+        var scores = self.dot(key.transpose(-1, -2)) * (1.0 / sqrt(Float64(d)))
+        if is_causal:
+            var t = self.shape()[self.ndim() - 2]
+            var l = key.shape()[key.ndim() - 2]
+            var allowed = (
+                Tensor.arange(l)
+                .reshape(1, l)
+                .le((Tensor.arange(t) + (l - t)).reshape(t, 1))
+            )
+            scores = allowed.where(scores, -inf[DType.float64]())
+        if attn_mask:
+            var m = attn_mask.value()
+            if m.dtype().is_bool():
+                scores = m.where(scores, -inf[DType.float64]())
+            else:
+                scores = scores + m
+        return scores.softmax(-1).dot(value)
+
+    def tril(self, diagonal: Int = 0) raises -> Tensor:
+        """Zeros above diagonal `diagonal` of the last two dimensions."""
+        var r = self.shape()[self.ndim() - 2]
+        var c = self.shape()[self.ndim() - 1]
+        var keep = (
+            Tensor.arange(c)
+            .reshape(1, c)
+            .le((Tensor.arange(r) + diagonal).reshape(r, 1))
+        )
+        return keep.where(self, self._scalar(0.0, True))
+
+    def triu(self, diagonal: Int = 0) raises -> Tensor:
+        """Zeros below diagonal `diagonal` of the last two dimensions."""
+        var r = self.shape()[self.ndim() - 2]
+        var c = self.shape()[self.ndim() - 1]
+        var keep = (
+            Tensor.arange(c)
+            .reshape(1, c)
+            .ge((Tensor.arange(r) + diagonal).reshape(r, 1))
+        )
+        return keep.where(self, self._scalar(0.0, True))
 
     # ---- functional
 

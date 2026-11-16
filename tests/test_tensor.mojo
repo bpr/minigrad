@@ -237,5 +237,28 @@ def test_item_and_string() raises:
     assert_equal(x.to_string(), "[[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]")
 
 
+def test_half_storage() raises:
+    var d: List[Float64] = [1.0, -2.5, 0.1, 65504.0, 3.0e38]
+    var x = Tensor(d)
+    # float16 keeps 11 significant bits and overflows past 65504;
+    # bfloat16 keeps 8 bits and float32's range.
+    var h = x.half()
+    assert_equal(h.dtype(), DT.float16)
+    assert_close(h.slice(0, 0, 4), [1.0, -2.5, 0.0999755859375, 65504.0])
+    var b = x.cast(DT.bfloat16)
+    assert_close(b.slice(0, 0, 4), [1.0, -2.5, 0.10009765625, 65536.0])
+    assert_true(abs(b.tolist()[4] / 3.0e38 - 1.0) < 1.0 / 256.0)
+    assert_equal((h + h).dtype(), DT.float16)
+    assert_equal((h + b).dtype(), DT.float32)
+    var s = Tensor.ones(3000).half().sum()
+    assert_equal(s.dtype(), DT.float16)
+    assert_close(s, [3000.0])  # accumulated in float32: exact
+
+
+def test_round() raises:
+    var d: List[Float64] = [-2.5, -1.5, -0.5, 0.4, 0.5, 1.5, 2.5, 2.6, -2.6]
+    assert_close(Tensor(d).round(), [-2, -2, 0, 0, 0, 2, 2, 3, -3])
+
+
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()

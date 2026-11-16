@@ -251,3 +251,40 @@ struct LayerNorm(Copyable, Module):
 
     def parameters(self) -> List[Tensor]:
         return [self.weight, self.bias]
+
+
+@fieldwise_init
+struct Quantized(Copyable):
+    """Integers and their scales: the original is `q * scale`."""
+
+    var q: Tensor
+    """`int8` values, of the original's shape."""
+    var scale: Tensor
+    """`float32`, of the original's shape with size 1 everywhere but
+    the quantized axis."""
+
+
+def quantize_int8(w: Tensor, axis: Int) raises -> Quantized:
+    """Symmetric `int8` quantization with one scale per index of `axis`.
+
+    Each slice along `axis` is scaled so its largest magnitude maps to
+    127 and rounded. The result is realized.
+
+    Args:
+        w: The tensor to quantize.
+        axis: The dimension that keeps its own scales (a layer's output
+            dimension, so each output has one).
+
+    Returns:
+        The integers and the scales.
+    """
+    var others = List[Int]()
+    var a = axis + w.ndim() if axis < 0 else axis
+    for d in range(w.ndim()):
+        if d != a:
+            others.append(d)
+    var amax = w.abs()._reduce(1, others, True)  # REDUCE_MAX
+    var scale = amax.eq(0.0).where(1.0, amax * (1.0 / 127.0))
+    var q = (w / scale).round().clip(-127.0, 127.0).cast(DT.int8)
+    Tensor.realize_all([q, scale])
+    return Quantized(q, scale)

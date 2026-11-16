@@ -68,12 +68,16 @@ Tests import `tests/helpers.mojo`, so they need `-I tests` as well
 | `minigrad/schedule.mojo` | Graph to kernels: which nodes get buffers, fusion, execution order |
 | `minigrad/runtime/kernel.mojo` | `Kernel`, `Plan`, `make_plan` (lowering), `run_plan` (the executor) |
 | `minigrad/runtime/blockops.mojo` | Typed SIMD loops over one block: the executor's instruction set |
-| `minigrad/runtime/gemm.mojo` | The tuned matrix-multiply kernel (also runs convolutions) |
+| `minigrad/runtime/gemm.mojo` | The tuned matrix-multiply kernel (also runs convolutions), and its matrix-vector path |
+| `minigrad/runtime/pool.mojo` | The persistent thread pool: `run_parallel[task](ctx, n)` |
 | `minigrad/tensor.mojo` | `Tensor`: the user API |
 | `minigrad/nn/` | Layers (`Linear`, `Conv2d`, `BatchNorm`, `LayerNorm`) and optimizers (`SGD`, `Adam`, `AdamW`) |
 | `minigrad/datasets.mojo` | MNIST loader |
+| `minigrad/nn/__init__.mojo` (end) | `quantize_int8`: symmetric int8 with a scale per output |
+| `minigrad/json.mojo`, `minigrad/safetensors.mojo` | A minimal JSON reader; reading safetensors weights |
+| `minigrad/llm/` | `bpe.mojo` (GPT-2's tokenizer), `gpt2.mojo` (the model, with a key-value cache) |
 | `tests/` | One `test_*.mojo` per area; `helpers.mojo` has `assert_close` |
-| `examples/` | `mnist.mojo` (needs `examples/get_mnist.sh` first) |
+| `examples/` | `mnist.mojo`, `gpt2.mojo` (need `examples/get_mnist.sh`, `examples/get_gpt2.sh` first) |
 | `benchmarks/` | Mojo programs and their tinygrad counterparts in `benchmarks/tinygrad/` |
 
 ## Architecture in one page
@@ -103,8 +107,10 @@ See `docs/architecture.md` for the reasoning. The path of a computation:
    into loops; plans are cached by the kernel's structure (not its
    buffers, not its constants' values), so a training loop builds each
    plan once. Three execution shapes, chosen per kernel:
-   - *contraction* (`sum_k A[i,k] B[k,j]`, which covers matmul, its
-     gradients, and convolution): offset tables for `gemm.mojo`;
+   - *contraction* (`sum_k A[b,i,k] B[b,k,j]`, which covers matmul, its
+     gradients, convolution, and attention): offset tables for
+     `gemm.mojo`, one product per batch index `b`. Up to 16 rows, `gemm`
+     streams B once (matrix-vector); otherwise it tiles;
    - *one vector dimension*: an odometer over the other dimensions, and
      blocks of 256 along the vector one;
    - *flattened*: when the best single dimension is short, trailing
@@ -142,6 +148,22 @@ Design points that span several files:
   view.
 - **Reference counts**: a node's `rc` counts `UOp` handles and parent
   nodes. Gradient slots hold a raw id with a manual `incref`/`decref`.
+- **Two eager operations sit outside the graph**: `take_rows` (an
+  embedding lookup, done on the host) and `write_` (the one in-place
+  write, for key-value caches; the target must own its buffer). Views of
+  a written tensor see the writes.
+- **Weights in lower precision are a cast, not a format.** A
+  contraction operand may be a cast of a buffer (`float16`, `bfloat16`,
+  `int8` into a `float32` kernel): the scheduler leaves it unmaterialized,
+  the planner makes it `gemm`'s B, and `gemm[dt, bdt]` converts B as it
+  packs or streams it. `x.dot(w)` with a 16-bit `w` gets this from type
+  promotion; int8 is `x.dot(q) * scale`. GPT-2's `Weight` struct wraps
+  it. The test for exactness: stored natively must equal float32
+  weights rounded the same way (`test_gpt2_perplexity`).
+- **Threads come from one pool** (`runtime/pool.mojo`), used by `gemm`
+  and batched products. Jobs are split into several chunks per thread
+  where that costs nothing, so one preempted thread holds up only a
+  small share.
 
 ## Mojo traps this project has hit
 
@@ -153,6 +175,17 @@ Each of these cost a debugging session.
   anything that creates nodes (`UOp._make1(..., a)` exists for this).
   The same rule makes "at the end of the test, nothing leaked" checks
   see zero live nodes: sample inside the loop.
+- **An address passed as an `Int` does not keep its value alive.** In
+  `run_parallel[t](Int(jobs.unsafe_ptr()), n)` the conversion is the
+  last use of `jobs`, so the list may be freed (or, for a stack struct,
+  its stores optimized away) before the tasks read it. Write
+  `_ = jobs^` after the call. It cost a crash in release builds only
+  and silently wrong results (zeros) in another case.
+- **`mojo run` unmaps the program's code at exit.** Threads still
+  running it then crash the process after `main` returns. The pool is
+  registered with `_get_global`'s destroy hook, which stops and joins
+  its threads first; any new long-lived thread needs the same.
+- `fn` is still a keyword: it cannot name a parameter or a field.
 - **References into the arena dangle.** `graph()[].nodes[i].shape` is a
   reference into a `List` that reallocates when a node is added. Copy
   (`x.shape()`) before calling anything that builds nodes. Passing such a
@@ -177,8 +210,14 @@ Each of these cost a debugging session.
 - Mojo has no global variables. The graph and the runtime are
   `std.ffi._Global` singletons (`graph()`, `runtime()`), about 5 ns per
   access: fetch the pointer once in a hot function.
-- `TestSuite`'s per-test timings are not reliable; use `time` on a built
-  binary or `perf_counter_ns` when measuring.
+- `TestSuite`'s per-test timings are not reliable (it reported 325 s for
+  a test file that ran in 0.4 s); use `time` on a built binary or
+  `perf_counter_ns` when measuring.
+- **Benchmarks on this machine are noisy.** The CPU governor is
+  `powersave` (idle cores sit at 600 MHz and a lone thread can land on
+  one), and other sessions compile in bursts. Take numbers only when
+  `/proc/loadavg` is below 1, report medians over many steps, and
+  distrust a single-threaded figure with a large gap to its minimum.
 - Integer division by zero in a SIMD loop traps the process; the integer
   division loops are scalar and exact for that reason.
 
@@ -210,6 +249,14 @@ Each of these cost a debugging session.
   sizes that cross block, tile, and thread boundaries.
 - `tests/test_nn.mojo` includes the loop invariants: a training loop
   must not grow the graph, the buffer table, or the plan cache.
+- `tests/test_llm.mojo` covers JSON, safetensors, `write_`/`take_rows`,
+  attention against a direct computation, and the pool; with
+  `data/gpt2` present, the tokenizer against tiktoken's ids and GPT-2's
+  greedy output against tinygrad's.
+- Larger checks against references live in the benchmark harness:
+  `benchmarks/gpt2_bench.mojo` and `benchmarks/tinygrad/gpt2_bench.py`
+  have matching `logits` and `greedy` actions (see
+  `benchmarks/README.md`).
 
 ## Working alongside other sessions
 

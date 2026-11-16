@@ -21,13 +21,15 @@ struct DT(Equatable, Hashable, ImplicitlyCopyable, Writable):
     comptime uint32 = DT(6)
     comptime int64 = DT(7)
     comptime uint64 = DT(8)
-    comptime float32 = DT(9)
-    comptime float64 = DT(10)
+    comptime float16 = DT(9)
+    comptime bfloat16 = DT(10)
+    comptime float32 = DT(11)
+    comptime float64 = DT(12)
 
-    comptime COUNT = 11
+    comptime COUNT = 13
     """The number of data types."""
 
-    comptime default_float = DT(9)
+    comptime default_float = DT(11)
     """The type of a float literal: `float32`."""
     comptime default_int = DT(5)
     """The type of an integer literal: `int32`."""
@@ -45,15 +47,20 @@ struct DT(Equatable, Hashable, ImplicitlyCopyable, Writable):
         """The size of one element in bytes."""
         if self.code <= 2:
             return 1
-        if self.code <= 4:
+        if self.code <= 4 or self.code == 9 or self.code == 10:
             return 2
-        if self.code <= 6 or self.code == 9:
+        if self.code <= 6 or self.code == 11:
             return 4
         return 8
 
     def is_float(self) -> Bool:
         """Whether this is a floating-point type."""
         return self.code >= 9
+
+    def is_half(self) -> Bool:
+        """Whether this is a 16-bit float: `float16` or `bfloat16`. They
+        are for storage: arithmetic on them is done in `float32`."""
+        return self.code == 9 or self.code == 10
 
     def is_bool(self) -> Bool:
         """Whether this is `bool`."""
@@ -93,6 +100,10 @@ struct DT(Equatable, Hashable, ImplicitlyCopyable, Writable):
         if self.code == 8:
             return "uint64"
         if self.code == 9:
+            return "float16"
+        if self.code == 10:
+            return "bfloat16"
+        if self.code == 11:
             return "float32"
         return "float64"
 
@@ -103,13 +114,25 @@ struct DT(Equatable, Hashable, ImplicitlyCopyable, Writable):
         writer.write("DT.", self.name())
 
 
+def parse_dtype(name: String) raises -> DT:
+    """The type named `name` (`"float32"`, `"bfloat16"`, ...).
+
+    Raises:
+        If there is no such type.
+    """
+    for c in range(DT.COUNT):
+        if DT(c).name() == name:
+            return DT(c)
+    raise Error(t"unknown element type '{name}'")
+
+
 def promote(a: DT, b: DT) -> DT:
     """The smallest type both `a` and `b` convert to without loss of kind.
 
     This is tinygrad's `least_upper_dtype` on its promotion lattice: a
     signed and an unsigned integer of the same width join at the next
-    signed width, `int64` and `uint64` join at `float32`, and any float
-    absorbs any integer.
+    signed width, `int64` and `uint64` join at `float32`, `float16` and
+    `bfloat16` join at `float32`, and any float absorbs any integer.
 
     Args:
         a: A data type.
@@ -120,6 +143,8 @@ def promote(a: DT, b: DT) -> DT:
     """
     if a == b:
         return a
+    if a.is_half() and b.is_half():
+        return DT.float32  # neither holds the other's values
     if a.is_float() or b.is_float():
         return DT(max(a.code, b.code))
     if a.is_bool():
@@ -146,8 +171,9 @@ def promote(a: DT, b: DT) -> DT:
 def sum_acc_dtype(dt: DT) -> DT:
     """The type a sum of `dt` elements accumulates in.
 
-    As in tinygrad (and NumPy): `bool` and narrow integers widen to at
-    least 32 bits, keeping their signedness; other types are unchanged.
+    As in tinygrad: `bool` and narrow integers widen to at least 32 bits,
+    keeping their signedness, and 16-bit floats to `float32`; other types
+    are unchanged.
 
     Args:
         dt: The element type being summed.
@@ -159,4 +185,6 @@ def sum_acc_dtype(dt: DT) -> DT:
         return DT.int32
     if dt.is_int() and dt.itemsize() < 4:
         return DT.uint32 if dt.is_unsigned() else DT.int32
+    if dt.is_half():
+        return DT.float32
     return dt

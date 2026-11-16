@@ -8,41 +8,57 @@ are in `~/markdown/tinygrad-mojo.md`.
 
 Done: the tensor API (creation, arithmetic with broadcasting and type
 promotion, comparison, reductions, movement, matmul, convolution,
-pooling, normalization, cross-entropy), reverse-mode gradients of all of
-it, `SGD`/`Adam`/`AdamW`, `Linear`/`Conv2d`/`BatchNorm`/`LayerNorm`, the
-scheduler, the block executor with flattened dimensions, a threaded
-`gemm`, and MNIST training end to end (97.9% test accuracy in 70 steps,
+pooling, normalization, attention, cross-entropy), reverse-mode
+gradients of all of it, `SGD`/`Adam`/`AdamW`,
+`Linear`/`Conv2d`/`BatchNorm`/`LayerNorm`, the scheduler, the block
+executor with flattened dimensions, `gemm` (tiled, matrix-vector, and
+batched) on a persistent thread pool, MNIST training end to end, and
+GPT-2 inference (97.9% test accuracy in 70 steps,
 as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
 `benchmarks/README.md`.
 
 ## Next
 
-1. **Transformer inference**, the brief's headline benchmark. Needs:
-   - `gather`/embedding lookup as a primitive (an index load in the
-     executor), rather than one-hot times table;
-   - slicing with steps and `__getitem__` with ranges; `cumsum`;
-     `tril`/`triu`; `scaled_dot_product_attention`;
-   - a weight loader (safetensors) and a tokenizer (GPT-2 BPE);
-   - a way to append to a KV cache without copying it. This is the one
-     place immutable buffers hurt: see "eager in-place writes" below.
-   - batched matmul with a shared batch dimension in `gemm` (today it
-     takes the block executor): an outer loop over the shared
-     dimensions around the contraction.
-2. **Fuse elementwise work after a reduction** (`sum * c`, `matmul +
+1. **Finish transformer inference.** GPT-2 runs: tokenizer, safetensors
+   weights, key-value cache, greedy and sampled generation, checked
+   against tinygrad and tiktoken. Decode is within about 25% of the
+   memory-bandwidth floor for float32 weights, and 16-bit or int8
+   weights cut decode time by half or more. What remains:
+   - **Batches of sequences** and **continuous batching** (the brief's
+     decode scenario with 1 to 64 active sequences): a cache per
+     sequence, ragged lengths, and a scheduler of requests.
+   - **Better quantization.** Weights can be `float16`, `bfloat16`, or
+     per-output `int8` (4.3% higher perplexity on Shakespeare). Scales
+     per group of 32 to 128 inputs would recover most of that and allow
+     4-bit weights, but they vary along the summed dimension and so do
+     not factor out of the product: `gemm` would have to apply them as
+     it converts B (a scale table beside B, read per block of k).
+     Activations stay `float32`; quantizing them (int8 dot products) is
+     a different, larger change.
+   - **Fused attention** for long prompts: today scores, softmax, and
+     the weighted sum are separate kernels and the scores are
+     materialized (`T x L` per head).
+   - **A larger model** (Llama-style: RoPE, RMSNorm, SwiGLU, grouped
+     keys and values) to reach the brief's 1-8B sizes.
+   - `gather` as a lazy, differentiable primitive (an index load in the
+     executor); `take_rows` is eager and host-side today.
+   - Slicing with steps and `__getitem__` with ranges; `cumsum`;
+     `multinomial`.
+2. **Cut host work per step.** A GPT-2 decode step spends about 1.1 ms
+   building the graph and scheduling its 307 kernels around 9.7 ms of
+   kernels; a small MLP training step spends 70 µs of its 100. Cache
+   whole schedules keyed on the graph's structure and replay them
+   (tinygrad's `TinyJit`, without the capture step). For decode, a
+   cache whose plans do not depend on the context length (a fixed
+   maximum with a mask, as tinygrad does) would also stop the plan
+   cache growing with each new length.
+3. **Fuse elementwise work after a reduction** (`sum * c`, `matmul +
    bias`, `relu` of a convolution) into the reduction's kernel. For
    `gemm` kernels: apply the tail to each tile, or run it as a second
    pass over the output while it is in cache.
-3. **A persistent thread pool**, and threads for the block executor.
-   `gemm` creates threads per call (about 50 µs each), so it stays
-   serial below 32M multiply-adds and scales to about 3.6x on 8 cores at
-   1024 cubed. With a pool: parallel packing of B, shared between
-   threads, and elementwise kernels over large tensors split by outer
-   dimension.
-4. **Cache whole schedules.** A training step rebuilds its graph,
-   gradient, and kernels every time (about 70 µs for a small MLP); the
-   result is always the same list of kernels over different buffers.
-   Key the schedule on the graph's structure and replay it (tinygrad's
-   `TinyJit`, without the capture step).
+4. **Threads for the block executor.** The pool exists; the block
+   loops still run on one thread. Split large elementwise kernels by
+   outer dimension.
 5. **GPU.** Mojo compiles kernels for NVIDIA and AMD ahead of time
    (`max.gpu`, and `mojo build --emit` lists `nvptx`), which fits this
    design: the block instruction set and `gemm` become GPU kernels, and
@@ -51,10 +67,21 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
 6. **Python bindings**: a package exposing `Tensor` to Python with
    zero-copy NumPy interchange, so the engine can be driven from
    notebooks and existing tinygrad model code.
-7. **The benchmark matrix** of the brief: PyTorch (eager and compiled)
-   and MAX as comparators; vision models; dynamic shapes; memory.
+7. **The benchmark matrix** of the brief: PyTorch (eager and compiled),
+   llama.cpp, and MAX as comparators; vision models; dynamic shapes;
+   memory.
 
 ## Smaller items
+
+- **An open regression**: since the pool, the 512 x 784 x 512 forward
+  product of the MLP benchmark is bimodal (313 µs best, about 1 ms
+  median) where the same work in the other layout is a steady 430-490
+  µs, and the MLP step went from 1.26 to 1.83 ms. The standalone `gemm`
+  benchmark of that layout is a steady 270 µs, so the difference is in
+  how the engine calls it (buffers, timing between jobs), not the
+  kernel. The first training step also grew (27 to 59 ms at batch 64).
+- `gemm` allocates its packing buffers on every call (about 150 page
+  faults each); keep them per pool thread.
 
 - The gradient of overlapping pooling windows is still a sum of one
   padded term per window offset (`_window_grad`); fine for 3 by 3, slow
@@ -86,10 +113,17 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
   (write in place only when nothing else refers to the buffer) is
   exactly the set of cases where rebinding is free. Dropped for
   immutable buffers.
-- **Eager in-place writes** are the likely answer for KV caches: an
-  explicit, immediately executed "write these elements into that
-  buffer", outside the lazy graph, on a buffer the caller created with
-  `Tensor.empty` (which is never shared). Not built yet.
+- **Eager in-place writes** are how key-value caches work: `write_`
+  copies into a buffer the tensor owns, immediately, outside the lazy
+  graph. It refuses a buffer shared with another tensor.
+- **Creating threads per `gemm` call** (the first version): about 50 µs
+  per call, so `gemm` stayed serial below 32M multiply-adds, and a
+  GPT-2 decode step makes 49 products. Replaced by the pool. Its
+  workers spin for 2 ms after a job before they sleep: waking a
+  sleeping thread can take most of a millisecond on this machine.
+- **One chunk per thread**: a single thread preempted by another
+  process held up every product; with four column chunks per thread,
+  claimed as threads come free, it holds up a quarter as much.
 - **Reference-counted node objects** (`ArcPointer[Node]` with children):
   Mojo cannot derive the destructor of a type that refers to itself
   through `ArcPointer`, and an arena of ids gives dense traversal state
