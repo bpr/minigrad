@@ -183,10 +183,10 @@ mask hiding the rest.
 
 `Batcher` (`minigrad/llm/batching.mojo`) runs requests continuously on
 top of this: each step admits waiting requests to the lowest free slots
-(processing their prompts), then advances slots `0 .. h-1` by one token,
-`h` one past the highest occupied slot; free slots below `h` compute a
-dummy token at their own position 1, which the next prompt in that slot
-overwrites. A request that reaches its token limit, `<|endoftext|>`, or
+(processing their prompts), then advances every slot by one token, so
+the step's shape changes only every 64 positions and `MiniJit` captures
+it once per block; free slots compute a dummy token at their own
+position 1, which the next prompt in that slot overwrites. A request that reaches its token limit, `<|endoftext|>`, or
 the end of the context frees its slot. There is no paging and no
 copying of caches: a slot is `max_context` rows whether used or not.
 

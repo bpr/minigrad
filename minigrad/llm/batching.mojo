@@ -15,11 +15,10 @@ while b.step():
 print(b.output(a))
 ```
 
-A step advances slots `0 .. h-1`, `h` one past the highest occupied
-slot, through `GPT2.decode_batch` (and so through `MiniJit`). Free slots
-below `h` compute a dummy token at their own position 1, which the next
-prompt admitted to that slot overwrites. New requests take the lowest
-free slot, so `h` stays small as the load falls.
+A step advances every slot through `GPT2.decode_batch`, so its shape
+changes only with the longest position and `MiniJit` needs one capture
+per block of 64 positions. Free slots compute a dummy token at their own
+position 1, which the next prompt admitted to that slot overwrites.
 """
 
 from std.collections import Deque
@@ -138,12 +137,9 @@ struct Batcher(Movable):
             self.slot_request[s] = id
             self.slot_pos[s] = len(self.prompts[id])
             self._emit(s, sample(logits.tolist(), self.temperature, self.top_k))
-        # Advance slots 0 .. h-1.
-        var h = 0
-        for s in range(len(self.slot_request)):
-            if self.slot_request[s] >= 0:
-                h = s + 1
-        if h > 0:
+        # Advance every slot.
+        var h = len(self.slot_request)
+        if self.active() > 0:
             var tokens = List[Int](capacity=h)
             var positions = List[Int](capacity=h)
             for s in range(h):

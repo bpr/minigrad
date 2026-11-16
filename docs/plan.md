@@ -37,10 +37,12 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
    - **Continuous batching performance.** `Batcher` works (requests
      arriving at any time get the tokens they get alone) but is not
      measured on a quiet machine; at a load average of 15 it was slower
-     than serving requests one at a time. Things to try, in order, once
-     numbers are reliable: step all slots every time (one `MiniJit`
-     capture per 64-position block instead of one per active-slot count
-     and block); the batched throughput item above; and a slot layout
+     than serving requests one at a time. Stepping every slot (one
+     `MiniJit` capture per 64-position block) and stepping only up to
+     the highest occupied slot measured the same within the noise; the
+     first was kept as the simpler. What remains, once numbers are
+     reliable: the batched throughput item above, which is the real
+     limit (a step of 8 costs about 8 steps of 1); and a slot layout
      that does not reserve `max_context` rows per sequence (pages of
      the cache, as vLLM does) if memory, not time, becomes the limit.
    - **Better quantization.** Weights can be `float16`, `bfloat16`, or

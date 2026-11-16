@@ -74,7 +74,7 @@ def main() raises:
     if action == "serve":
         # R requests with prompts of 3 or more tokens of IDS and 16 to
         # 63 new tokens each, all arriving at once: continuous batching
-        # in S slots against serving them one at a time.
+        # in S slots against one at a time.
         var slots = nums[0]
         var r = nums[1]
         var prompts = List[List[Int]]()
@@ -93,39 +93,21 @@ def main() raises:
             stop_at_eot=False,
         )
         var t0 = perf_counter_ns()
-        var ids = List[Int]()
         for i in range(r):
-            ids.append(b.submit(prompts[i], limits[i]))
-        var finish = List[Int](length=r, fill=0)
+            _ = b.submit(prompts[i], limits[i])
         while b.step():
-            for i in range(r):
-                if finish[i] == 0 and b.finished(ids[i]):
-                    finish[i] = Int(perf_counter_ns() - t0)
-        var t1 = perf_counter_ns()
-        for i in range(r):
-            if finish[i] == 0:
-                finish[i] = Int(t1 - t0)
+            pass
+        var bsec = Float64(perf_counter_ns() - t0) / 1e9
+        print(
+            t"{dtype}, {r} requests, {total} tokens. Batcher, {slots} slots:"
+            t" {bsec} s, {Float64(total) / bsec} tokens/s"
+        )
         var model = GPT2("data/gpt2/model.safetensors", 256, dtype)
-        var seq_finish = List[Int]()
         var t2 = perf_counter_ns()
         for i in range(r):
             _ = model.generate(prompts[i], limits[i])
-            seq_finish.append(Int(perf_counter_ns() - t2))
-        var t3 = perf_counter_ns()
-        var mean_b = 0.0
-        var mean_s = 0.0
-        for i in range(r):
-            mean_b += Float64(finish[i]) / Float64(r) / 1e9
-            mean_s += Float64(seq_finish[i]) / Float64(r) / 1e9
-        print(
-            t"{dtype}, {r} requests, {total} tokens. Continuous batching,"
-            t" {slots} slots: {Float64(t1 - t0) / 1e9} s,"
-            t" {Float64(total) / (Float64(t1 - t0) / 1e9)} tokens/s, mean"
-            t" completion {mean_b} s. One at a time:"
-            t" {Float64(t3 - t2) / 1e9} s,"
-            t" {Float64(total) / (Float64(t3 - t2) / 1e9)} tokens/s, mean"
-            t" completion {mean_s} s."
-        )
+        var sec = Float64(perf_counter_ns() - t2) / 1e9
+        print(t"one at a time: {sec} s, {Float64(total) / sec} tokens/s")
         return
     if action == "batch":
         # B prompts: IDS without its last 0, 1, ... B-1 tokens, so the
