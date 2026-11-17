@@ -319,6 +319,10 @@ def test_matmul_threads() raises:
     var a = _seq([n, k])
     var b = _seq([k, m]) * 0.5
     assert_close(a @ b, _matmul_ref(a.tolist(), b.tolist(), n, k, m), 2e-1)
+    # A transposed (a weight gradient's shape): packed, one chunk per
+    # thread.
+    var at = _seq([k, n]).T()
+    assert_close(at @ b, _matmul_ref(at.tolist(), b.tolist(), n, k, m), 2e-1)
 
 
 def test_batched_matmul() raises:

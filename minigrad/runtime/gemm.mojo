@@ -378,19 +378,32 @@ def _block[dt: DType, bdt: DType](job: _Job):
                 if not ak_unit:
                     # Pack A[ic:ic+mc, kp:kp+kc] into panels of MR rows,
                     # kc by MR each, padding the last panel with zeros.
+                    # Term by term: A's terms are not consecutive here, so
+                    # its rows usually are (a transpose), and a panel's
+                    # MR values of one term are one load.
                     for p in range(panels):
                         var dst = apack.unsafe_offset(p * kc * MR)
-                        for r in range(MR):
-                            var i = ic + p * MR + r
-                            if i < ic + mc:
-                                var row = a.unsafe_offset(ai[unsafe_offset=i])
-                                for k in range(kc):
-                                    dst[unsafe_offset=k * MR + r] = row[
-                                        unsafe_offset=ak[unsafe_offset=k]
+                        var i0 = ic + p * MR
+                        var rows = min(MR, ic + mc - i0)
+                        if rows == MR and _is_unit(ai.unsafe_offset(i0), MR):
+                            var src = a.unsafe_offset(ai[unsafe_offset=i0])
+                            for k in range(kc):
+                                dst.unsafe_store(
+                                    k * MR,
+                                    src.unsafe_load[width=MR, alignment=1](
+                                        ak[unsafe_offset=k]
+                                    ),
+                                )
+                        else:
+                            if rows < MR:
+                                unsafe_memset_zero(dst, kc * MR)
+                            for k in range(kc):
+                                var src = a.unsafe_offset(ak[unsafe_offset=k])
+                                var d = dst.unsafe_offset(k * MR)
+                                for r in range(rows):
+                                    d[unsafe_offset=r] = src[
+                                        unsafe_offset=ai[unsafe_offset=i0 + r]
                                     ]
-                            else:
-                                for k in range(kc):
-                                    dst[unsafe_offset=k * MR + r] = 0
                 for jp in range(jpanels):
                     var j0 = jc + jp * NR
                     var nr = min(NR, jc + nc - j0)
@@ -765,10 +778,15 @@ def gemm[
     # `threads == 1` means this call is itself a pool task: run_parallel
     # is not reentrant, so it must stay one chunk.
     if threads > 1 and ni * nj * nk >= PARALLEL_WORK:
+        # Every column chunk packs all of A when A's terms are not
+        # consecutive: then one chunk per thread.
+        var chunks = CHUNKS_PER_THREAD if _is_unit(
+            _IntPtr(unsafe_from_address=Int(ak.unsafe_ptr())), nk
+        ) else 1
         if by_rows:
             workers = max(1, min(threads, itiles))
         else:
-            workers = max(1, min(CHUNKS_PER_THREAD * threads, jtiles))
+            workers = max(1, min(chunks * threads, jtiles))
     var jobs = List[_Job](capacity=workers)
     for w in range(workers):
         # Whole tiles per thread, so no two threads share an element.

@@ -88,11 +88,8 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
 
 ## Smaller items
 
-- **The 512 / 512 MLP step** is 1.59 ms against 1.26 ms before the
-  thread pool. Part of the earlier regression was that the executor ran
-  every product on one thread (fixed); whether the rest is the pool or
-  the noise of that first measurement is not known. The first training
-  step also grew (27 to 59 ms at batch 64).
+- **The first training step** grew when the pool arrived (27 to 59 ms
+  for the convolutional network at batch 64); not yet explained.
 - `gemm` allocates its packing buffers on every call (about 150 page
   faults each); keep them per pool thread.
 
@@ -136,7 +133,10 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
   sleeping thread can take most of a millisecond on this machine.
 - **One chunk per thread**: a single thread preempted by another
   process held up every product; with four column chunks per thread,
-  claimed as threads come free, it holds up a quarter as much.
+  claimed as threads come free, it holds up a quarter as much. Kept
+  where every chunk would pack all of A (a transposed A): there the
+  repeated packing cost more than preemption did (512 / 512 MLP step
+  1.0 to 0.9 ms).
 - **Reference-counted node objects** (`ArcPointer[Node]` with children):
   Mojo cannot derive the destructor of a type that refers to itself
   through `ArcPointer`, and an arena of ids gives dense traversal state

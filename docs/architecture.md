@@ -325,7 +325,9 @@ created per call, which cost about 50 µs each and made small products
 serial. Workers claim tasks with a compare-and-swap on a counter tagged
 with the job's generation; between jobs they spin for 2 ms, then sleep
 on a futex. Products split into several column chunks per thread, so a
-thread the system preempts delays only its chunk.
+thread the system preempts delays only its chunk; except when A must be
+packed (its terms not consecutive, as in a weight gradient), since each
+column chunk packs all of A: then one chunk per thread.
 
 **Lower-precision weights.** Decode reads every weight once per token,
 so storing them in fewer bytes is the largest lever left. There is no

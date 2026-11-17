@@ -196,15 +196,16 @@ reading the loss.
 | batch / hidden | minigrad | tinygrad, `TinyJit` | tinygrad, no JIT | vs JIT | vs no JIT |
 |---|---:|---:|---:|---:|---:|
 | 8 / 32 | 76 µs | 828 µs | 10,510 µs | 11x | 138x |
-| 64 / 128 | 145 µs | 1,324 µs | 11,242 µs | 9.1x | 78x |
-| 512 / 512 | 1,585 µs | 27,702 µs | 37,454 µs | 17x | 24x |
+| 64 / 128 | 141 µs | 1,324 µs | 11,242 µs | 9.4x | 80x |
+| 512 / 512 | 900 µs | 27,702 µs | 37,454 µs | 31x | 42x |
 
 minigrad's column is from a quiet machine (load average below 1), after
 a fix that made the executor's products use their threads at all: from
 the thread pool's arrival until then, every product run through the
 executor got one thread (an argument passed through a stack struct by
-address read stale). With one thread the same steps take 226 µs and
-3,510 µs for the larger two sizes. tinygrad's columns are from an
+address read stale), and a second that packs a transposed A (a weight
+gradient's) term by term, one chunk per thread. With one thread the
+same steps take 228 µs and 3,316 µs for the larger two sizes. tinygrad's columns are from an
 earlier, noisier session.
 
 The first row is almost all host work, and is the comparison the brief
