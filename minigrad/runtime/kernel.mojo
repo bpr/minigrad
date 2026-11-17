@@ -851,6 +851,8 @@ struct Runtime(Movable):
     """One block of zero bytes."""
     var threads: Int
     """The most threads a kernel may use."""
+    var kernels_split: Int
+    """Block kernels run as chunks on several threads."""
     var debug: Int
     """The value of the environment variable `MINIGRAD_DEBUG`: at 2 and
     above, every kernel run is printed with its time."""
@@ -870,6 +872,7 @@ struct Runtime(Movable):
         self.zeros = unsafe_alloc[Byte](SLOT_BYTES, alignment=64)
         unsafe_memset_zero(self.zeros, SLOT_BYTES)
         self.threads = gemm_threads()
+        self.kernels_split = 0
         self.debug = 0
         var s = getenv("MINIGRAD_DEBUG")
         if s:
@@ -1008,9 +1011,161 @@ def run_plan(
             for i in range(nb):
                 _contract(p, c, a, b, i, rt[].threads)
         return
-    rt[].reserve(plan.nslots)
-    var scratch = rt[].scratch
-    var zeros = rt[].zeros
+    var nd = len(plan.sizes)
+    var length = plan.sizes[nd - 1]
+    var positions = 1
+    for d in range(nd - 1):
+        positions *= plan.sizes[d]
+    var rop = plan.reduce_op
+    if rop >= 0:
+        fill_identity(plan.dtype, rop, out_ptr, plan.out_size)
+    # Chunks that write disjoint outputs: of outer positions when no
+    # outer dimension is reduced, or of the vector dimension (whole
+    # blocks and groups) when it is not reduced.
+    var outer_ok = True
+    if rop >= 0:
+        for d in range(nd - 1):
+            if plan.out_strides[d] == 0 and plan.sizes[d] > 1:
+                outer_ok = False
+    var vec_ok = rop < 0 or not plan.vec_reduced
+    var group = plan.group
+    var unit = BLOCK // group * group if group <= BLOCK else group
+    var units = (length + unit - 1) // unit
+    var threads = rt[].threads
+    var chunks = 1
+    var by_outer = True
+    if threads > 1 and positions * length >= BLOCK_PARALLEL_WORK:
+        var most = CHUNKS_PER_THREAD * threads
+        if outer_ok and positions >= most:
+            chunks = most
+        elif vec_ok and units >= 2:
+            by_outer = False
+            chunks = min(most, units)
+        elif outer_ok:
+            chunks = positions
+    if chunks > 1:
+        rt[].kernels_split += 1
+    rt[].reserve(chunks * plan.nslots)
+    if chunks == 1:
+        _run_blocks(
+            Pointer[Plan, MutUntrackedOrigin](
+                unsafe_from_address=Int(Pointer(to=plan))
+            ),
+            out_ptr,
+            Pointer[BytePtr, MutUntrackedOrigin](
+                unsafe_from_address=Int(ins.unsafe_ptr())
+            ),
+            Pointer[Instr, MutUntrackedOrigin](
+                unsafe_from_address=Int(instrs.unsafe_ptr())
+            ),
+            rt[].scratch,
+            rt[].zeros,
+            0,
+            positions,
+            0,
+            length,
+        )
+        return
+    var blocks = List[_Blocks]()
+    blocks.append(
+        _Blocks(
+            Int(Pointer(to=plan)),
+            Int(out_ptr),
+            Int(ins.unsafe_ptr()),
+            Int(instrs.unsafe_ptr()),
+            Int(rt[].scratch),
+            Int(rt[].zeros),
+            by_outer,
+            chunks,
+            positions,
+            unit,
+        )
+    )
+    run_parallel[_blocks_task](Int(blocks.unsafe_ptr()), chunks)
+    # The tasks read `blocks` through an address: keep it alive.
+    _ = blocks^
+
+
+comptime BLOCK_PARALLEL_WORK = 1 << 15
+"""Loop elements (outer positions times the vector length) from which a
+kernel's blocks are split over threads."""
+
+comptime CHUNKS_PER_THREAD = 4
+"""Chunks of a kernel per thread, claimed as threads come free, so a
+thread the system preempts holds up only a small share."""
+
+
+@fieldwise_init
+struct _Blocks(Copyable):
+    """What a chunk of a block kernel needs: addresses of the plan, the
+    buffers, and the scratch memory, and how the kernel is split."""
+
+    var plan: Int
+    var out_ptr: Int
+    var ins: Int
+    var instrs: Int
+    var scratch: Int
+    var zeros: Int
+    var by_outer: Bool
+    """Chunks of outer positions, or else of the vector dimension."""
+    var chunks: Int
+    var positions: Int
+    """Outer positions in all."""
+    var unit: Int
+    """Elements of the vector dimension a chunk boundary is a multiple
+    of: whole blocks, and whole groups of a segmented reduction."""
+
+
+def _blocks_task(ctx: Int, i: Int):
+    """Chunk `i` of a block kernel, with its own block temporaries."""
+    var job = Pointer[_Blocks, MutUntrackedOrigin](unsafe_from_address=ctx)
+    var plan = Pointer[Plan, MutUntrackedOrigin](unsafe_from_address=job[].plan)
+    var n = job[].chunks
+    var length = plan[].sizes[len(plan[].sizes) - 1]
+    var p_lo = 0
+    var p_hi = job[].positions
+    var j_lo = 0
+    var j_hi = length
+    if job[].by_outer:
+        p_lo = job[].positions * i // n
+        p_hi = job[].positions * (i + 1) // n
+    else:
+        var units = (length + job[].unit - 1) // job[].unit
+        j_lo = units * i // n * job[].unit
+        j_hi = min(length, units * (i + 1) // n * job[].unit)
+    _run_blocks(
+        plan,
+        BytePtr(unsafe_from_address=job[].out_ptr),
+        Pointer[BytePtr, MutUntrackedOrigin](unsafe_from_address=job[].ins),
+        Pointer[Instr, MutUntrackedOrigin](unsafe_from_address=job[].instrs),
+        BytePtr(
+            unsafe_from_address=job[].scratch + i * plan[].nslots * SLOT_BYTES
+        ),
+        BytePtr(unsafe_from_address=job[].zeros),
+        p_lo,
+        p_hi,
+        j_lo,
+        j_hi,
+    )
+
+
+def _run_blocks(
+    pp: Pointer[Plan, MutUntrackedOrigin],
+    out_ptr: BytePtr,
+    ins: Pointer[BytePtr, MutUntrackedOrigin],
+    instrs: Pointer[Instr, MutUntrackedOrigin],
+    scratch: BytePtr,
+    zeros: BytePtr,
+    p_lo: Int,
+    p_hi: Int,
+    j_lo: Int,
+    j_hi: Int,
+):
+    """Runs outer positions `p_lo .. p_hi` (in odometer order) of a
+    block plan, over elements `j_lo .. j_hi` of the vector dimension."""
+    if p_lo >= p_hi or j_lo >= j_hi:
+        return
+    ref plan = pp[]
     var nd = len(plan.sizes)
     var nouter = nd - 1
     var length = plan.sizes[nd - 1]
@@ -1020,15 +1175,21 @@ def run_plan(
     var rop = plan.reduce_op
     var group = plan.group
 
-    if rop >= 0:
-        fill_identity(plan.dtype, rop, out_ptr, plan.out_size)
-
+    # The odometer at position `p_lo`.
     var idx = List[Int](length=nouter, fill=0)
+    var rem = p_lo
+    for d in range(nouter - 1, -1, -1):
+        idx[d] = rem % plan.sizes[d]
+        rem //= plan.sizes[d]
     var cur = List[Int](length=nl, fill=0)
     var valid = List[Bool](length=nl, fill=True)
     for l in range(nl):
         cur[l] = plan.loads[l].offset
+        for d in range(nouter):
+            cur[l] += idx[d] * plan.loads[l].strides[d]
     var out_off = 0
+    for d in range(nouter):
+        out_off += idx[d] * plan.out_strides[d]
     var regs = List[BytePtr](length=ni, fill=zeros)
 
     # Constants fill their block once.
@@ -1036,9 +1197,12 @@ def run_plan(
         ref ins_i = plan.instrs[i]
         if ins_i.op == K_CONST:
             var p = scratch.unsafe_offset(plan.slots[i] * SLOT_BYTES)
-            fill_block(ins_i.dtype, p, instrs[i].a, min(length, BLOCK))
+            fill_block(
+                ins_i.dtype, p, instrs[unsafe_offset=i].a, min(length, BLOCK)
+            )
             regs[i] = p
 
+    var left = p_hi - p_lo
     while True:
         # Per outer position: which loads are inside their masks, and
         # the blocks of loads that are constant along the vector.
@@ -1058,7 +1222,9 @@ def run_plan(
                     var p = scratch.unsafe_offset(plan.slots[i] * SLOT_BYTES)
                     splat_block(
                         ins_i.dtype,
-                        ins[l].unsafe_offset(cur[l] * ins_i.dtype.itemsize()),
+                        ins[unsafe_offset=l].unsafe_offset(
+                            cur[l] * ins_i.dtype.itemsize()
+                        ),
                         p,
                         min(length, BLOCK),
                     )
@@ -1066,15 +1232,15 @@ def run_plan(
                 else:
                     regs[i] = zeros
 
-        var j0 = 0
-        while j0 < length:
-            var n = min(BLOCK, length - j0)
+        var j0 = j_lo
+        while j0 < j_hi:
+            var n = min(BLOCK, j_hi - j0)
             if group > 1:
                 # Whole groups per block, or a block inside one group.
                 if group <= BLOCK:
-                    n = min(BLOCK // group * group, length - j0)
+                    n = min(BLOCK // group * group, j_hi - j0)
                 else:
-                    n = min(BLOCK, group - j0 % group)
+                    n = min(BLOCK, group - j0 % group, j_hi - j0)
             for i in range(ni):
                 ref ins_i = plan.instrs[i]
                 var op = ins_i.op
@@ -1093,7 +1259,7 @@ def run_plan(
                     if len(ld.table) > 0:
                         gather_table_block(
                             ins_i.dtype,
-                            ins[l].unsafe_offset(cur[l] * isz),
+                            ins[unsafe_offset=l].unsafe_offset(cur[l] * isz),
                             Pointer[Int, MutUntrackedOrigin](
                                 unsafe_from_address=Int(ld.table.unsafe_ptr())
                                 + 8 * j0
@@ -1112,11 +1278,13 @@ def run_plan(
                         hi = min(max(ld.mask[2 * nouter + 1] - j0, 0), n)
                     if lo == 0 and hi == n:
                         if vs == 1:
-                            regs[i] = ins[l].unsafe_offset(base * isz)
+                            regs[i] = ins[unsafe_offset=l].unsafe_offset(
+                                base * isz
+                            )
                         else:
                             gather_block(
                                 ins_i.dtype,
-                                ins[l].unsafe_offset(base * isz),
+                                ins[unsafe_offset=l].unsafe_offset(base * isz),
                                 vs,
                                 dst,
                                 n,
@@ -1127,7 +1295,9 @@ def run_plan(
                         if hi > lo:
                             gather_block(
                                 ins_i.dtype,
-                                ins[l].unsafe_offset((base + lo * vs) * isz),
+                                ins[unsafe_offset=l].unsafe_offset(
+                                    (base + lo * vs) * isz
+                                ),
                                 vs,
                                 dst.unsafe_offset(lo * isz),
                                 hi - lo,
@@ -1200,6 +1370,9 @@ def run_plan(
             j0 += n
 
         # Advance the odometer over the outer dimensions.
+        left -= 1
+        if left == 0:
+            break
         var d = nouter - 1
         while d >= 0:
             idx[d] += 1

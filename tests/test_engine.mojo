@@ -7,6 +7,7 @@ from std.testing import TestSuite, assert_equal, assert_true, assert_false
 
 from minigrad.dtype import DT
 from minigrad.graph import graph
+from minigrad.runtime.kernel import runtime
 from minigrad.tensor import Tensor
 from helpers import assert_close, assert_shape
 
@@ -377,6 +378,54 @@ def test_where_and_cast_across_blocks() raises:
         else:
             expect.append(-v)
     assert_close(got, expect)
+
+
+def _block_kernels(x: Tensor, y: Tensor) raises -> List[Tensor]:
+    """Kernels of every shape the block executor splits: flat and
+    strided elementwise, broadcast and padded loads, flattened offset
+    tables, `where` and casts, and reductions over leading, middle,
+    trailing, and several axes."""
+    var out = List[Tensor]()
+    out.append((x * y + 1.0).relu())
+    out.append(x.permute(2, 0, 1) + y.permute(2, 0, 1) * 2.0)
+    out.append(x + y.sum(0, keepdim=True))
+    out.append(x.pad([0, 0, 1, 2, 3, 0]).exp())
+    out.append(x.permute(0, 2, 1) * 3.0)
+    out.append(x.gt(0.5).where(x.int().float(), y))
+    out.append(x.sum(0))
+    out.append(x.sum(1))
+    out.append(x.sum(2))
+    out.append(x.max(1, 2))
+    out.append(x.permute(1, 0, 2).sum(0))
+    out.append((x * y).sum(0, 2))
+    for i in range(len(out)):
+        _ = out[i].realize()
+    return out^
+
+
+def test_blocks_split_over_threads() raises:
+    """Every block kernel shape on all threads equals the same kernel on
+    one thread, bit for bit: chunks split outputs, never an output's
+    order of summation."""
+    var rt = runtime()
+    var threads = rt[].threads
+    var split = rt[].kernels_split
+    for shape in [(64, 40, 30), (3, 7, 4000), (5000, 3, 5)]:
+        var sh: List[Int] = [shape[0], shape[1], shape[2]]
+        rt[].threads = 1
+        var one = _block_kernels(_seq(sh), _seq(sh) * 0.5)
+        rt[].threads = max(threads, 4)
+        var many = _block_kernels(_seq(sh), _seq(sh) * 0.5)
+        rt[].threads = threads
+        for i in range(len(one)):
+            var a = one[i].tolist()
+            var b = many[i].tolist()
+            assert_equal(len(a), len(b))
+            for e in range(len(a)):
+                assert_true(
+                    a[e] == b[e], String(t"kernel {i} of {sh}, element {e}")
+                )
+    assert_true(rt[].kernels_split >= split + 30)
 
 
 def main() raises:

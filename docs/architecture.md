@@ -272,6 +272,16 @@ SIMD loop in `blockops.mojo`. A load with stride 1 is not copied: its
 register points into the buffer. The last instruction of an unreduced
 kernel writes straight into the output.
 
+A kernel of at least 32K loop elements runs as chunks on the thread
+pool (`_run_blocks` runs any range of outer positions and of the vector
+dimension, with its own block temporaries). Chunks never share an
+output element: they are ranges of outer positions when no outer
+dimension is reduced, or else ranges of the vector dimension in whole
+blocks and whole groups of a segmented reduction, when it is not
+reduced. Each output is then summed in the same order as on one thread,
+so results do not depend on the thread count. A kernel reduced along
+both its vector and an outer dimension stays on one thread.
+
 This is an interpreter with a block as its unit of work, in the manner
 of numexpr, rather than a code generator. It has no compile step (the
 first step of a training loop costs what the hundredth does, plus plan

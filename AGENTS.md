@@ -41,7 +41,7 @@ Run a program against the source tree with `-I .`:
 pixi run mojo run -I . examples/mnist.mojo
 pixi run mojo build -I . -o build/mlp benchmarks/mlp_step.mojo
 MINIGRAD_DEBUG=2 build/mlp   # print every kernel run (and MiniJit replay step), with its time
-MINIGRAD_THREADS=1 build/mlp # cap the threads of the matmul kernel
+MINIGRAD_THREADS=1 build/mlp # cap the threads of every kernel
 ```
 
 Tests import `tests/helpers.mojo`, so they need `-I tests` as well
@@ -185,10 +185,11 @@ Design points that span several files:
   records state during a capture (`jit_state()`), copied back after each
   replay. Anything new that touches memory outside a kernel must record
   itself, or replays silently skip it.
-- **Threads come from one pool** (`runtime/pool.mojo`), used by `gemm`
-  and batched products. Jobs are split into several chunks per thread
-  where that costs nothing, so one preempted thread holds up only a
-  small share.
+- **Threads come from one pool** (`runtime/pool.mojo`), used by `gemm`,
+  batched products, and block kernels of 32K loop elements or more. Jobs
+  are split into several chunks per thread where that costs nothing, so
+  one preempted thread holds up only a small share. Chunks never split
+  one output's sum, so results do not depend on the thread count.
 
 ## Mojo traps this project has hit
 

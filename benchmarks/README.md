@@ -196,17 +196,17 @@ reading the loss.
 | batch / hidden | minigrad | tinygrad, `TinyJit` | tinygrad, no JIT | vs JIT | vs no JIT |
 |---|---:|---:|---:|---:|---:|
 | 8 / 32 | 76 µs | 828 µs | 10,510 µs | 11x | 138x |
-| 64 / 128 | 141 µs | 1,324 µs | 11,242 µs | 9.4x | 80x |
-| 512 / 512 | 900 µs | 27,702 µs | 37,454 µs | 31x | 42x |
+| 64 / 128 | 116 µs | 1,324 µs | 11,242 µs | 11x | 97x |
+| 512 / 512 | 717 µs | 27,702 µs | 37,454 µs | 39x | 52x |
 
-minigrad's column is from a quiet machine (load average below 1), after
-a fix that made the executor's products use their threads at all: from
-the thread pool's arrival until then, every product run through the
-executor got one thread (an argument passed through a stack struct by
-address read stale), and a second that packs a transposed A (a weight
-gradient's) term by term, one chunk per thread. With one thread the
-same steps take 228 µs and 3,316 µs for the larger two sizes. tinygrad's columns are from an
-earlier, noisier session.
+minigrad's column is from a quiet machine (load average below 1), with
+block kernels of 32K loop elements or more split over threads (before
+that: 141 and 900 µs for the larger two sizes). Two earlier fixes
+matter here: every product run through the executor had got one thread
+(an argument passed through a stack struct by address read stale), and
+a transposed A (a weight gradient's) is packed term by term, one chunk
+per thread. With one thread the larger two steps take 228 µs and 3,316
+µs. tinygrad's columns are from an earlier, noisier session.
 
 The first row is almost all host work, and is the comparison the brief
 cares about for small and dynamic workloads. minigrad rebuilds the
@@ -230,22 +230,25 @@ normalizations, two max pools, a linear layer), Adam, random data.
 
 | batch | minigrad | tinygrad, `TinyJit` | tinygrad, no JIT | vs JIT |
 |---|---:|---:|---:|---:|
-| 64 | 19.3 ms | 219.6 ms | 279.7 ms | 11x |
-| 512 | 160.3 ms | 1,735 ms | (not run) | 11x |
+| 64 | 9.9 ms | 219.6 ms | 279.7 ms | 22x |
+| 512 | 89.2 ms | 1,735 ms | (not run) | 19x |
 
-At batch 512 with one thread minigrad takes about 444 ms (3.9x).
+Block kernels split over threads since: before, 17.9 and 153 ms (about
+43% of the batch-512 step was block kernels on one thread). At batch 512
+with one thread minigrad takes about 444 ms (5.0x).
 
 First step, which for tinygrad includes generating and compiling its
 kernels and for minigrad includes building 107 plans:
 
 | batch | minigrad | tinygrad, `TinyJit` |
 |---|---:|---:|
-| 64 | 35 ms | 1,776 ms |
-| 512 | 220 ms | 4,831 ms |
+| 64 | 22 ms | 1,776 ms |
+| 512 | 123 ms | 4,831 ms |
 
-(Earlier figures of 59 and 472 ms do not reproduce: builds from before
-the thread pool, from the commit that first reported them, and current
-all take 28 to 36 ms and 200 to 255 ms on a quiet machine.)
+(Earlier figures of 59 and 472 ms did not reproduce: builds from before
+the thread pool, from the commit that first reported them, and from
+before block kernels used threads all took 28 to 36 ms and 200 to 255
+ms on a quiet machine.)
 
 ## MNIST, start to finish
 
@@ -255,7 +258,7 @@ steps, including startup and loading the data.
 
 | | wall time | final test accuracy |
 |---|---:|---:|
-| minigrad | 15.4 s | 97.71% |
+| minigrad | 9.1 s | 98.04% |
 | tinygrad (`DEV=CPU`, `STEPS=70`) | 183 s | 97.63% |
 
 The two runs draw different random batches and initial weights, so the

@@ -71,18 +71,15 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
    bias`, `relu` of a convolution) into the reduction's kernel. For
    `gemm` kernels: apply the tail to each tile, or run it as a second
    pass over the output while it is in cache.
-4. **Threads for the block executor.** The pool exists; the block
-   loops still run on one thread. Split large elementwise kernels by
-   outer dimension.
-5. **GPU.** Mojo compiles kernels for NVIDIA and AMD ahead of time
+4. **GPU.** Mojo compiles kernels for NVIDIA and AMD ahead of time
    (`max.gpu`, and `mojo build --emit` lists `nvptx`), which fits this
    design: the block instruction set and `gemm` become GPU kernels, and
    the plan picks them. Needs a device field on buffers, transfers, and
    an allocator per device.
-6. **Python bindings**: a package exposing `Tensor` to Python with
+5. **Python bindings**: a package exposing `Tensor` to Python with
    zero-copy NumPy interchange, so the engine can be driven from
    notebooks and existing tinygrad model code.
-7. **The benchmark matrix** of the brief: PyTorch (eager and compiled),
+6. **The benchmark matrix** of the brief: PyTorch (eager and compiled),
    llama.cpp, and MAX as comparators; vision models; dynamic shapes;
    memory.
 
