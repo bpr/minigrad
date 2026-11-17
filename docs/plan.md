@@ -88,8 +88,6 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
 
 ## Smaller items
 
-- **The first training step** grew when the pool arrived (27 to 59 ms
-  for the convolutional network at batch 64); not yet explained.
 - `gemm` allocates its packing buffers on every call (about 150 page
   faults each); keep them per pool thread.
 

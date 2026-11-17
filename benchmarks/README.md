@@ -240,12 +240,12 @@ kernels and for minigrad includes building 107 plans:
 
 | batch | minigrad | tinygrad, `TinyJit` |
 |---|---:|---:|
-| 64 | 59.1 ms | 1,776 ms |
-| 512 | 471.7 ms | 4,831 ms |
+| 64 | 35 ms | 1,776 ms |
+| 512 | 220 ms | 4,831 ms |
 
-(minigrad's first step grew from 27 and 202 ms when the pool arrived;
-starting the pool's threads is part of it, and the rest is not yet
-explained.)
+(Earlier figures of 59 and 472 ms do not reproduce: builds from before
+the thread pool, from the commit that first reported them, and current
+all take 28 to 36 ms and 200 to 255 ms on a quiet machine.)
 
 ## MNIST, start to finish
 
