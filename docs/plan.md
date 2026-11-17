@@ -88,8 +88,6 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
 
 ## Smaller items
 
-- `gemm` allocates its packing buffers on every call (about 150 page
-  faults each); keep them per pool thread.
 
 - The gradient of overlapping pooling windows is still a sum of one
   padded term per window offset (`_window_grad`); fine for 3 by 3, slow
@@ -135,6 +133,14 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
   where every chunk would pack all of A (a transposed A): there the
   repeated packing cost more than preemption did (512 / 512 MLP step
   1.0 to 0.9 ms).
+- **Packing buffers kept per pool thread** (instead of `gemm`
+  allocating them per call): not built, as measurement showed nothing to
+  gain. glibc reuses the freed blocks, so steady-state steps fault no
+  pages (MLP and convolutional training: none per step; GPT-2 decode:
+  about 8 per step, batch 8: none), and a few allocations per product
+  are, by estimate (49 products, about 50 ns each), under 1% of a
+  decode step. It would need a thread index or thread-local storage in
+  the pool.
 - **Reference-counted node objects** (`ArcPointer[Node]` with children):
   Mojo cannot derive the destructor of a type that refers to itself
   through `ArcPointer`, and an arena of ids gives dense traversal state
