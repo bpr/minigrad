@@ -128,6 +128,13 @@ struct Kernel(Movable):
     var loads: List[Load]
     var instrs: List[Instr]
     """The program; the last instruction is the value."""
+    var fused: Bool
+    """Whether the output goes on to the next kernel, which finishes it
+    in place, instead of becoming the root's buffer (a reduction whose
+    elementwise tail is fused)."""
+    var in_place: Int
+    """The load that reads the previous kernel's output, which this
+    kernel overwrites in place, or -1 (see `fused`)."""
 
     def __init__(out self, root: Int, var shape: List[Int], dtype: DT):
         self.root = root
@@ -137,6 +144,8 @@ struct Kernel(Movable):
         self.dtype = dtype
         self.loads = List[Load]()
         self.instrs = List[Instr]()
+        self.fused = False
+        self.in_place = -1
 
     def out_size(self) -> Int:
         """The number of elements in the output."""
@@ -696,6 +705,10 @@ struct CachedKernel(Copyable):
     """The kernel's program (it supplies constants' values)."""
     var label: String
     """A description, for `MINIGRAD_DEBUG`."""
+    var fused: Bool
+    """As `Kernel.fused`."""
+    var in_place: Int
+    """As `Kernel.in_place`."""
 
     def __init__(
         out self,
@@ -705,6 +718,8 @@ struct CachedKernel(Copyable):
         nbytes: Int,
         var instrs: List[Instr],
         var label: String,
+        fused: Bool,
+        in_place: Int,
     ):
         self.plan = plan
         self.root = root
@@ -712,6 +727,8 @@ struct CachedKernel(Copyable):
         self.nbytes = nbytes
         self.instrs = instrs^
         self.label = label^
+        self.fused = fused
+        self.in_place = in_place
 
 
 comptime STEP_KERNEL = 0
@@ -853,6 +870,8 @@ struct Runtime(Movable):
     """The most threads a kernel may use."""
     var kernels_split: Int
     """Block kernels run as chunks on several threads."""
+    var kernels_fused: Int
+    """Reductions run with their elementwise tail fused."""
     var debug: Int
     """The value of the environment variable `MINIGRAD_DEBUG`: at 2 and
     above, every kernel run is printed with its time."""
@@ -873,6 +892,7 @@ struct Runtime(Movable):
         unsafe_memset_zero(self.zeros, SLOT_BYTES)
         self.threads = gemm_threads()
         self.kernels_split = 0
+        self.kernels_fused = 0
         self.debug = 0
         var s = getenv("MINIGRAD_DEBUG")
         if s:

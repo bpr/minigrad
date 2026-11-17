@@ -19,6 +19,12 @@ AGENTS.md.
 - After a change to the planner or executor, rerun
   `benchmarks/mlp_step.mojo` and `examples/mnist.mojo` and compare with
   `benchmarks/README.md`; update the table if the numbers moved.
+- **Keep `commit_msg.txt` current.** After every change to the tree,
+  however small and even mid-task, overwrite `commit_msg.txt` (repo
+  root) with a message under 20 words (never over 100) covering
+  exactly what `git status` shows as uncommitted; check `git log -1`
+  first, as the user commits between turns. Never end a turn with it
+  stale.
 - A new deviation from tinygrad goes in
   `docs/differences-from-tinygrad.md`; a design that was tried and
   dropped goes in `docs/plan.md`.

@@ -90,6 +90,9 @@ struct _Scheduler(Movable):
     """Buffers created for padded constants, alive until execution."""
     var fail_node: Int
     """The node to force as a root after a reshape failed to fuse."""
+    var run_order: List[Int]
+    """The kernels in the order they run: each fused reduction just
+    before the kernel that finishes it."""
 
     def __init__(out self):
         self.order = List[Int]()
@@ -102,6 +105,7 @@ struct _Scheduler(Movable):
         self.kernels = List[Kernel]()
         self.keep = List[UOp]()
         self.fail_node = -1
+        self.run_order = List[Int]()
         self.chain_parent.append(-1)
         self.chain_node.append(-1)
 
@@ -399,6 +403,85 @@ struct _Scheduler(Movable):
             self.kernels.append(k^)
         return True
 
+    def fuse(mut self, roots: List[Int]):
+        """Fuses elementwise work after a reduction into it: when the only
+        reader of a reduction is one elementwise kernel, of the same shape
+        and type, reading it element for element, the reduction runs into
+        that kernel's buffer and the kernel finishes it in place. The
+        reduction's own value is then never stored, so this is done only
+        if nothing outside this schedule can need it later: no reference
+        from outside reaches it except through nodes realized now."""
+        var g = graph()
+        var n = len(self.order)
+        var e = g[].epoch
+        # References to each node from the scheduled graph.
+        var edges = List[Int](length=n, fill=0)
+        for i in range(n):
+            var node = self.order[i]
+            for j in range(3):
+                var c = g[].nodes[node].s0
+                if j == 1:
+                    c = g[].nodes[node].s1
+                elif j == 2:
+                    c = g[].nodes[node].s2
+                if c >= 0 and g[].stamp[c] == e:
+                    edges[g[].pos[c]] += 1
+        # Nodes whose value may be wanted after this schedule: those with
+        # references from outside, and what they are computed from, down
+        # to the nodes realized now.
+        var later = List[Bool](length=n, fill=False)
+        for ii in range(n):
+            var i = n - 1 - ii
+            var node = self.order[i]
+            if g[].nodes[node].rc > edges[i]:
+                later[i] = True
+            if not later[i] or self.is_root[i]:
+                continue
+            for j in range(3):
+                var c = g[].nodes[node].s0
+                if j == 1:
+                    c = g[].nodes[node].s1
+                elif j == 2:
+                    c = g[].nodes[node].s2
+                if c >= 0 and g[].stamp[c] == e:
+                    later[g[].pos[c]] = True
+        var kernel_of = Dict[Int, Int]()
+        var readers = Dict[Int, Int]()
+        for ki in range(len(self.kernels)):
+            kernel_of[self.kernels[ki].root] = ki
+            for l in self.kernels[ki].loads:
+                readers[l.node] = readers.get(l.node, 0) + 1
+        var body_of = List[Int](length=len(self.kernels), fill=-1)
+        for ki in range(len(self.kernels)):
+            if self.kernels[ki].reduce_op >= 0:
+                continue
+            for li in range(len(self.kernels[ki].loads)):
+                var r = self.kernels[ki].loads[li].node
+                var rk = kernel_of.get(r, -1)
+                if rk < 0 or readers.get(r, 0) != 1 or r in roots:
+                    continue
+                if self.kernels[rk].reduce_op < 0 or later[g[].pos[r]]:
+                    continue
+                ref ke = self.kernels[ki]
+                if (
+                    self.kernels[rk].dtype != ke.dtype
+                    or ke.out_size() == 0
+                    or ke.out_size() != self.kernels[rk].out_size()
+                    or ke.loads[li].view != View.identity(ke.shape)
+                ):
+                    continue
+                self.kernels[rk].fused = True
+                self.kernels[ki].in_place = li
+                body_of[ki] = rk
+                break
+        self.run_order.clear()
+        for ki in range(len(self.kernels)):
+            if self.kernels[ki].fused:
+                continue
+            if body_of[ki] >= 0:
+                self.run_order.append(body_of[ki])
+            self.run_order.append(ki)
+
     def execute(mut self) raises -> Optional[List[CachedKernel]]:
         """Runs the kernels, in topological order, and turns their roots
         into buffers.
@@ -414,7 +497,8 @@ struct _Scheduler(Movable):
         var cached = List[CachedKernel]()
         var e = g[].epoch
         var ins = List[Int]()
-        for ki in range(len(self.kernels)):
+        var pending = -1
+        for ki in self.run_order:
             ref k = self.kernels[ki]
             var plan_id = -1
             if prod(k.shape) > 0:
@@ -439,6 +523,10 @@ struct _Scheduler(Movable):
                     t"{k.dtype} {k.shape}{red}  loads {len(k.loads)} instrs"
                     t" {len(k.instrs)}"
                 )
+            if k.fused:
+                label += "  (tail fused)"
+            if k.in_place >= 0:
+                label += "  (in place)"
             var ck = CachedKernel(
                 plan_id,
                 g[].pos[k.root],
@@ -446,11 +534,16 @@ struct _Scheduler(Movable):
                 k.out_size() * k.dtype.itemsize(),
                 k.instrs.copy(),
                 label^,
+                k.fused,
+                k.in_place,
             )
             ins.clear()
-            for l in k.loads:
-                ins.append(g[].nodes[l.node].arg[0])
-            _run(ck, k.root, ins)
+            for li in range(len(k.loads)):
+                if li == k.in_place:
+                    ins.append(-1)
+                else:
+                    ins.append(g[].nodes[k.loads[li].node].arg[0])
+            pending = _run(ck, k.root, ins.copy(), pending)
             cached.append(ck^)
         self.keep.clear()
         if cacheable:
@@ -458,12 +551,20 @@ struct _Scheduler(Movable):
         return None
 
 
-def _run(ck: CachedKernel, root: Int, in_bufs: List[Int]) raises:
+def _run(
+    ck: CachedKernel, root: Int, var in_bufs: List[Int], pending: Int
+) raises -> Int:
     """Runs one kernel, reading buffers `in_bufs`, into a new buffer, and
-    makes `root` that buffer. A `MiniJit` capture records it."""
+    makes `root` that buffer. A `MiniJit` capture records it.
+
+    A fused kernel's buffer is returned instead, for the next kernel
+    (with `in_place` set) to read and finish as `pending`; otherwise the
+    result is -1."""
     var g = graph()
     var rt = runtime()
-    var out_buf = g[].alloc_buffer(ck.nbytes)
+    var out_buf = pending if ck.in_place >= 0 else g[].alloc_buffer(ck.nbytes)
+    if ck.in_place >= 0:
+        in_bufs[ck.in_place] = out_buf
     if rt[].recording:
         for b in in_bufs:
             g[].hold(b)
@@ -489,18 +590,33 @@ def _run(ck: CachedKernel, root: Int, in_bufs: List[Int]) raises:
                 t"{kind} {Float64(perf_counter_ns() - t0) / 1e3} us "
                 t" {ck.label}  loops {plan.sizes}"
             )
+    if ck.fused:
+        rt[].kernels_fused += 1
+        return out_buf
     g[].become_buffer(root, out_buf)
+    return -1
 
 
 def _signature(order: List[Int], roots: List[Int]) -> NodeKey:
     """The structure of the graph `order` (a topological order) holds:
     each node's operation, element type, shape, argument, and inputs by
-    position, without the identity of its buffers. Graphs with equal
-    signatures get the same schedule."""
+    position, without the identity of its buffers, and whether anything
+    outside the graph refers to it (which decides fusion). Graphs with
+    equal signatures get the same schedule."""
     var g = graph()
-    var d = List[Int](capacity=12 * len(order))
+    var edges = List[Int](length=len(order), fill=0)
     for n in order:
         ref node = g[].nodes[n]
+        if node.s0 >= 0:
+            edges[g[].pos[node.s0]] += 1
+        if node.s1 >= 0:
+            edges[g[].pos[node.s1]] += 1
+        if node.s2 >= 0:
+            edges[g[].pos[node.s2]] += 1
+    var d = List[Int](capacity=12 * len(order))
+    for i in range(len(order)):
+        ref node = g[].nodes[order[i]]
+        d.append(1 if node.rc > edges[i] else 0)
         d.append(node.op)
         d.append(node.dtype.code)
         d.append(g[].pos[node.s0] if node.s0 >= 0 else -1)
@@ -550,12 +666,13 @@ def realize(roots: List[UOp]) raises:
             g[].stats.ns_group += Int(t1 - t0)
             g[].stats.schedule_hits += 1
             var ins = List[Int]()
+            var pending = -1
             for i in range(len(rt[].schedules[found])):
                 ref ck = rt[].schedules[found][i]
                 ins.clear()
                 for p in ck.inputs:
                     ins.append(g[].nodes[order[p]].arg[0])
-                _run(ck, order[ck.root], ins)
+                pending = _run(ck, order[ck.root], ins.copy(), pending)
             g[].stats.ns_execute += Int(perf_counter_ns() - t1)
             return
         key = sig^
@@ -570,6 +687,7 @@ def realize(roots: List[UOp]) raises:
         g[].stats.ns_group += Int(t2 - t0)
         g[].stats.ns_build += Int(t3 - t2)
         if built:
+            s.fuse(ids)
             var cached = s.execute()
             g[].stats.ns_execute += Int(perf_counter_ns() - t3)
             if cached and key:
