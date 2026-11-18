@@ -97,3 +97,22 @@ and throw away a round whose load rose above 1.
   `/tmp/claude-1000/...`); remove it too.
 - Update `commit_msg.txt` (CLAUDE.md's rule), and delete this file once
   the numbers are in.
+
+## Status (2026-11-17, second session)
+
+Run on an i7-12700H laptop (20 threads, no AVX-512), not the 9800X3D
+the README's tables come from, so absolute numbers were not copied into
+the tables. On this machine the load average rises to 5-10 during the
+run from minigrad's own pool threads alone (the machine is otherwise
+96% idle), so the "below 1" rule cannot hold during a run here.
+
+- Cast change: no regression. Interleaved base/new pairs agree within
+  noise for the MLP, convnet, GPT-2 float32/bfloat16, and MNIST (27.5 s
+  base, 27.0 s new). int8 decode looked 20% slower in two rounds; four
+  more interleaved pairs gave new 5.5/5.6/6.6/6.6 ms against base
+  6.4/6.5/6.6/6.6 ms. Same kernel and plan counts.
+- Python MNIST finished: 26.8 s, 97.87%, peak RSS 3.6 GB (added to the
+  README as a separate-machine note).
+- Python MLP here: 181/84, 711/380, 4120/4133 µs (plain/jit).
+- Still to do on the 9800X3D: the quiet tables above, then delete this
+  file.

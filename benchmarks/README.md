@@ -248,6 +248,15 @@ back to back at a load average of 4 (not a quiet machine). The Python
 step gathers uint8 images and converts them in the graph; the Mojo
 example builds float batches on the host.
 
+Start to finish (70 steps, test accuracy on all 10,000 images every 10
+steps) on a different machine, an Intel i7-12700H laptop otherwise
+idle: `beautiful_mnist.py` takes 26.8 s and reaches 97.87%, against
+27.0 s for `examples/mnist.mojo`. A training step's median is 263 ms; a
+step with an evaluation takes 1.4 to 1.7 s. Peak memory is 3.6 GB,
+mostly from evaluating the test set in one batch, as tinygrad's file
+does. Only the totals compare across the two machines, not the
+absolute times.
+
 ```sh
 pixi run python-build
 PYTHONPATH=python pixi run python benchmarks/mlp_step.py 8 32 3000 jit
