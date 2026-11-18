@@ -2,7 +2,9 @@
 
 minigrad follows tinygrad's API and semantics where it can. This page
 lists where it does not, and why. Add to it whenever a deviation is
-introduced.
+introduced. The Python package's own differences (host-side random
+numbers inside `TinyJit`, indexing by tensors, read-only `numpy()`) are
+in `docs/python.md`.
 
 ## Semantics
 

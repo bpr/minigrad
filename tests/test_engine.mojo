@@ -276,6 +276,45 @@ def test_converted_operand() raises:
     assert_true(graph()[].stats.gemm_kernels >= before + 30)
 
 
+def test_pad_over_ops_that_break_zeros() raises:
+    """A pad over `exp`, `log`, a reciprocal, a division, `pow` or an
+    equality reads zeros where it pads, not `f(0)`: the padded value
+    must equal padding a realized copy."""
+    var x = _seq([3, 4]).abs() + 0.5
+    var y = _seq([3, 4]) * 2.0 + 3.0
+    var vals = List[Tensor]()
+    vals.append(x.exp())
+    vals.append(x.log())
+    vals.append(x.reciprocal())
+    vals.append(x / y)
+    vals.append(x.pow(y))
+    vals.append(x.eq(x).float())
+    vals.append(Tensor.eye(3))
+    vals.append((x.exp() + 1.0).sqrt())
+    for v in vals:
+        var want = v.contiguous().realize().pad([1, 2, 0, 3]).tolist()
+        assert_close(v.pad([1, 2, 0, 3]), want, 1e-5)
+        # Moved by more than the pad: a transpose and a shrink.
+        var w = v.contiguous().realize().T().pad([2, 0, 1, 1])
+        assert_close(v.T().pad([2, 0, 1, 1]), w.tolist(), 1e-5)
+
+
+def test_unconverted_operand() raises:
+    """An operand cast from a type gemm does not convert (uint8 images,
+    int32), or a second converted operand, is materialized first: the
+    product still runs on gemm."""
+    var x = (_seq([40, 100]) * 3.0).round().abs()
+    var w = _seq([100, 90])
+    for dt in [DT.uint8, DT.int32, DT.float16]:
+        var xq = x.cast(dt).realize()
+        var wq = w.cast(dt).realize() if dt == DT.float16 else w
+        var expect = xq.float().contiguous() @ wq.float().contiguous()
+        var want = expect.tolist()
+        var before = graph()[].stats.gemm_kernels
+        assert_close(xq.float() @ wq.float(), want, 1e-3)
+        assert_true(graph()[].stats.gemm_kernels == before + 1)
+
+
 def test_schedule_cache() raises:
     """A graph of a structure seen before replays its schedule, on its
     own buffers; a different constant is a different structure."""

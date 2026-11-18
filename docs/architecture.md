@@ -141,13 +141,23 @@ Roots are: the requested nodes; every reduction; `CONTIGUOUS` nodes; an
 elementwise node that more than one kernel reads (found by propagating
 "which kernel reads me" from parents to inputs; movement nodes pass the
 mark through); and both operands of a contraction, so that the kernel is
-exactly two loads and a multiply.
+exactly two loads and a multiply. An operand that is a cast of a buffer
+stays unmaterialized when `gemm` can convert it as it reads (16-bit
+floats or int8 into float32, one operand); any other cast is a root.
 
 A kernel is built by walking down from its root. Elementwise nodes
 become instructions. Movement nodes are pushed on a chain; at a buffer
 (or another root, which will be a buffer by then) the chain is applied,
 innermost first, to the buffer's identity view. The result is an SSA
 program whose leaves are `(buffer, view)` loads and constants.
+
+Pushing a pad down to the loads is right only if every operation in
+between keeps zeros zero: the masked loads read 0, so the kernel
+computes `f(0)` where the pad should give 0. `exp`, `log`, reciprocals,
+division, modulo, `pow` and equality do not; when the walk meets one
+under a pad, that node is made a root and scheduling restarts, as for a
+reshape that does not fuse (tinygrad has the same rule, its "unsafe pad
+ops"). Constants under a pad are padded too, so `pad(x + 1)` fuses.
 
 ### Schedules are cached by structure
 

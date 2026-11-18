@@ -5,3 +5,7 @@
 data/
 # build outputs
 build/
+
+# the Python bindings engine, built by pixi run python-build
+python/minigrad/_ext.so
+__pycache__/

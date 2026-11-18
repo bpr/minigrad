@@ -315,7 +315,11 @@ struct Tensor(ImplicitlyCopyable, Writable):
     @staticmethod
     def randn(*shape: Int) -> Tensor:
         """Standard normal `float32` samples."""
-        var sh = _list(shape)
+        return Tensor.randn(_list(shape))
+
+    @staticmethod
+    def randn(sh: List[Int]) -> Tensor:
+        """Standard normal `float32` samples of shape `sh`."""
         var u = UOp.new_buffer(DT.float32, sh)
         var p = graph()[].buffer_ptr(u.id).unsafe_bitcast[Float32]()
         var n = prod(sh)
@@ -1578,8 +1582,12 @@ struct Tensor(ImplicitlyCopyable, Writable):
         """The sum over the given dimensions (all when none are given).
         Narrow integers and booleans are summed as 32-bit integers, and
         16-bit floats in `float32` and converted back, as in tinygrad."""
+        return self.sum(_list(axis), keepdim)
+
+    def sum(self, axes: List[Int], keepdim: Bool = False) raises -> Tensor:
+        """The sum over `axes` (all dimensions when empty)."""
         var x = self.cast(sum_acc_dtype(self.dtype()))
-        var s = x._reduce(REDUCE_SUM, _list(axis), keepdim)
+        var s = x._reduce(REDUCE_SUM, axes, keepdim)
         if self.dtype().is_half():
             return s.cast(self.dtype())
         return s
@@ -1588,9 +1596,17 @@ struct Tensor(ImplicitlyCopyable, Writable):
         """The maximum over the given dimensions (all when none)."""
         return self._reduce(REDUCE_MAX, _list(axis), keepdim)
 
+    def max(self, axes: List[Int], keepdim: Bool = False) raises -> Tensor:
+        """The maximum over `axes` (all dimensions when empty)."""
+        return self._reduce(REDUCE_MAX, axes, keepdim)
+
     def min(self, *axis: Int, keepdim: Bool = False) raises -> Tensor:
         """The minimum over the given dimensions (all when none)."""
-        return self.neg()._reduce(REDUCE_MAX, _list(axis), keepdim).neg()
+        return self.min(_list(axis), keepdim)
+
+    def min(self, axes: List[Int], keepdim: Bool = False) raises -> Tensor:
+        """The minimum over `axes` (all dimensions when empty)."""
+        return self.neg()._reduce(REDUCE_MAX, axes, keepdim).neg()
 
     def _count(self, axes: List[Int]) raises -> Int:
         """The number of elements reduced over `axes`."""
@@ -1608,7 +1624,10 @@ struct Tensor(ImplicitlyCopyable, Writable):
 
     def mean(self, *axis: Int, keepdim: Bool = False) raises -> Tensor:
         """The mean over the given dimensions (all when none)."""
-        var axes = _list(axis)
+        return self.mean(_list(axis), keepdim)
+
+    def mean(self, axes: List[Int], keepdim: Bool = False) raises -> Tensor:
+        """The mean over `axes` (all dimensions when empty)."""
         var x = self
         if not x.dtype().is_float():
             x = x.cast(DT.default_float)
@@ -1620,7 +1639,12 @@ struct Tensor(ImplicitlyCopyable, Writable):
     ) raises -> Tensor:
         """The variance over the given dimensions, dividing by the count
         minus `correction`."""
-        var axes = _list(axis)
+        return self.`var`(_list(axis), keepdim, correction)
+
+    def `var`(
+        self, axes: List[Int], keepdim: Bool = False, correction: Int = 1
+    ) raises -> Tensor:
+        """The variance over `axes` (all dimensions when empty)."""
         var x = self
         if not x.dtype().is_float():
             x = x.cast(DT.default_float)
@@ -1635,18 +1659,13 @@ struct Tensor(ImplicitlyCopyable, Writable):
         self, *axis: Int, keepdim: Bool = False, correction: Int = 1
     ) raises -> Tensor:
         """The standard deviation over the given dimensions."""
-        var axes = _list(axis)
-        var x = self
-        if not x.dtype().is_float():
-            x = x.cast(DT.default_float)
-        var m = x._reduce(REDUCE_SUM, axes, True) * (
-            1.0 / Float64(self._count(axes))
-        )
-        var d = x - m
-        var n = max(1, self._count(axes) - correction)
-        return (
-            (d * d)._reduce(REDUCE_SUM, axes, keepdim) * (1.0 / Float64(n))
-        ).sqrt()
+        return self.`var`(_list(axis), keepdim, correction).sqrt()
+
+    def std(
+        self, axes: List[Int], keepdim: Bool = False, correction: Int = 1
+    ) raises -> Tensor:
+        """The standard deviation over `axes` (all dimensions when empty)."""
+        return self.`var`(axes, keepdim, correction).sqrt()
 
     def argmax(self, axis: Int = -1) raises -> Tensor:
         """The index of the first maximum along `axis`, as `int32`."""

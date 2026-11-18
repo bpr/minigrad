@@ -82,9 +82,15 @@ Early. What works, on CPU:
 - **Continuous batching**: `Batcher` serves requests that arrive at any
   time, up to `batch` at once, a finished one's slot going to the next.
 
-What does not exist yet: a GPU backend, Python bindings, an HTTP server
-in front of the batcher, group-wise or 4-bit quantization, indexing with slices and
-index tensors, and models beyond GPT-2. `docs/plan.md` has the order of
+- **Python bindings**: `python/minigrad` has tinygrad's API (`Tensor`,
+  `TinyJit`, `nn`, `nn.optim`, `nn.state`) over the engine, with NumPy
+  interchange that does not copy on the way out. tinygrad's
+  `beautiful_mnist.py` runs on it with its imports changed
+  (`examples/beautiful_mnist.py`). See `docs/python.md`.
+
+What does not exist yet: a GPU backend, an HTTP server in front of the
+batcher, group-wise or 4-bit quantization, slicing and index tensors
+in the Mojo API (Python has them), and models beyond GPT-2. `docs/plan.md` has the order of
 work.
 
 Measured against tinygrad's CPU backend on one machine, GPT-2 decodes
@@ -110,6 +116,22 @@ pixi run mojo run -I . examples/mnist.mojo     # 70 steps, batch 512
 
 bash examples/get_gpt2.sh                      # 550 MB into data/gpt2/
 pixi run mojo run -I . examples/gpt2.mojo --prompt "Hello." --count 40
+```
+
+From Python (NumPy is in the pixi environment):
+
+```sh
+pixi run python-build                          # python/minigrad/_ext.so
+pixi run python-test
+PYTHONPATH=python pixi run python examples/beautiful_mnist.py
+```
+
+```python
+from minigrad import Tensor, nn
+
+x = Tensor.rand(4, 3, requires_grad=True)
+(x @ Tensor.ones(3, 2)).relu().sum().backward()
+print(x.grad.numpy())
 ```
 
 `examples/gpt2.mojo` takes `--temperature` (0 for greedy; default 0.8),
@@ -146,6 +168,7 @@ The API follows tinygrad's names. The differences that come up first:
 |---|---|
 | `docs/architecture.md` | How a computation becomes loops, and why it is built this way |
 | `docs/differences-from-tinygrad.md` | Every deliberate deviation |
+| `docs/python.md` | The Python package: how it is built, what it covers, how it differs |
 | `docs/plan.md` | What is next; what was tried and dropped |
 | `benchmarks/README.md` | Numbers and how to reproduce them |
 | `AGENTS.md` | Layout, conventions, and Mojo traps, for people and coding assistants |

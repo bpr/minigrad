@@ -124,12 +124,25 @@ struct MiniJit(Movable):
             return out^
         if self.calls == 2:
             return self._capture(f, inputs)
-        return self._replay(inputs)
+        return self.replay(inputs)
 
     def _capture[
         F: def(List[Tensor]) raises -> List[Tensor]
     ](mut self, f: F, inputs: List[Tensor]) raises -> List[Tensor]:
-        var g = graph()
+        self.begin_capture(inputs)
+        var out: List[Tensor]
+        try:
+            out = f(inputs)
+        except e:
+            self.abort_capture()
+            raise e^
+        return self.end_capture(out)
+
+    def begin_capture(mut self, inputs: List[Tensor]) raises:
+        """Starts recording a step on `inputs`: what `__call__` does on
+        its second call, for callers that run the step themselves (the
+        Python bindings). End with `end_capture`, or `abort_capture` if
+        the step fails."""
         var rt = runtime()
         for x in inputs:
             self.inputs.append(_buffer_of(x))
@@ -139,15 +152,34 @@ struct MiniJit(Movable):
         jit_state()[].tensors.clear()
         jit_state()[].before.clear()
         rt[].recording = True
-        var out: List[Tensor]
+
+    def abort_capture(mut self):
+        """Stops a recording without keeping it."""
+        runtime()[].recording = False
+        runtime()[].tape.clear()
+        jit_state()[].tensors.clear()
+        jit_state()[].before.clear()
+        self.inputs.clear()
+        self.in_shapes.clear()
+        self.in_dtypes.clear()
+        self.outputs.clear()
+
+    def end_capture(mut self, outputs: List[Tensor]) raises -> List[Tensor]:
+        """Finishes the recording begun by `begin_capture`; `outputs` are
+        the step's outputs.
+
+        Returns:
+            The outputs, realized.
+        """
+        var g = graph()
+        var rt = runtime()
         try:
-            out = f(inputs)
-            Tensor.realize_all(out)
+            Tensor.realize_all(outputs)
             Tensor.realize_all(jit_state()[].tensors)
-            for t in out:
+            for t in outputs:
                 self.outputs.append(_buffer_of(t))
         except e:
-            rt[].recording = False
+            self.abort_capture()
             raise e^
         rt[].recording = False
         self.tape = rt[].tape.copy()
@@ -172,7 +204,7 @@ struct MiniJit(Movable):
                 g[].unhold(b)
             g[].unhold(s.out)
         self.held = keep^
-        for t in out:
+        for t in outputs:
             self.out_shapes.append(t.shape())
             self.out_dtypes.append(t.dtype())
         # Assigned tensors go back to the buffers the tape reads, holding
@@ -198,9 +230,18 @@ struct MiniJit(Movable):
             _ = st.tensors[i].assign(Tensor(before))
         st.tensors.clear()
         st.before.clear()
-        return out^
+        return outputs.copy()
 
-    def _replay(self, inputs: List[Tensor]) raises -> List[Tensor]:
+    def replay(self, inputs: List[Tensor]) raises -> List[Tensor]:
+        """Runs the recorded step on `inputs`: what `__call__` does from
+        its third call on.
+
+        Returns:
+            The outputs, on the capture's output buffers.
+
+        Raises:
+            If an input's shape or type differs from the capture's.
+        """
         var g = graph()
         var rt = runtime()
         if len(inputs) != len(self.inputs):
@@ -262,9 +303,13 @@ struct MiniJit(Movable):
 
 
 def _buffer_of(t: Tensor) raises -> Int:
-    """The buffer holding `t`, realizing it in its own memory if need be."""
+    """The buffer holding `t`, realizing it in its own memory if need be.
+    A view is copied, and `t` is pointed at the copy, so the step and
+    later replays read the buffer the capture recorded."""
     var u = t._contiguous_uop()
-    return graph()[].nodes[u.id].arg[0]
+    if u.id != t.uop().id:
+        t._replace(u)
+    return graph()[].nodes[t.uop().id].arg[0]
 
 
 def _copy_buffer(src: Int, dst: Int):

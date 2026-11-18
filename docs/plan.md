@@ -14,7 +14,8 @@ gradients of all of it, `SGD`/`Adam`/`AdamW`,
 executor with flattened dimensions, `gemm` (tiled, matrix-vector, and
 batched) on a persistent thread pool, MNIST training end to end, and
 GPT-2 inference (97.9% test accuracy in 70 steps,
-as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
+as tinygrad's `beautiful_mnist`), and Python bindings with tinygrad's
+API (`docs/python.md`). CPU only. Numbers are in
 `benchmarks/README.md`.
 
 ## Next
@@ -77,15 +78,20 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
    design: the block instruction set and `gemm` become GPU kernels, and
    the plan picks them. Needs a device field on buffers, transfers, and
    an allocator per device.
-5. **Python bindings**: a package exposing `Tensor` to Python with
-   zero-copy NumPy interchange, so the engine can be driven from
-   notebooks and existing tinygrad model code.
-6. **The benchmark matrix** of the brief: PyTorch (eager and compiled),
+5. **The benchmark matrix** of the brief: PyTorch (eager and compiled),
    llama.cpp, and MAX as comparators; vision models; dynamic shapes;
    memory.
 
 ## Smaller items
 
+- **Python bindings**: building a graph from Python adds about 20 µs
+  to an MLP step of about 100 operations (8/32: 76 µs in Mojo, 94 µs
+  from Python, 20 µs under `TinyJit`). Batching several operations
+  per call would cut
+  it. Random functions draw on the host, so a `TinyJit` step must take
+  its random indices as inputs; a counter-based generator in the graph
+  (tinygrad's Threefry) would lift that. Indexing by tensors beyond
+  dimension 0, `cumsum`, `GroupNorm`, `ConvTranspose2d` are missing.
 
 - The gradient of overlapping pooling windows is still a sum of one
   padded term per window offset (`_window_grad`); fine for 3 by 3, slow

@@ -223,6 +223,30 @@ step went, measured when it took 102 µs:
 
 Plans are built once: 33 over the whole run, none after the first step.
 
+### From Python
+
+`benchmarks/mlp_step.py` is tinygrad's `mlp_step.py` with minigrad's
+imports, on the Python bindings (`docs/python.md`). Medians over the
+second half of 3,000 steps (300 for 512/512), on a quiet machine, two
+runs each:
+
+| batch / hidden | Mojo | Python | Python, `TinyJit` | tinygrad, `TinyJit` |
+|---|---:|---:|---:|---:|
+| 8 / 32 | 76 µs | 94 µs | 20 µs | 828 µs |
+| 64 / 128 | 116 µs | 148 to 152 µs | 81 to 109 µs | 1,324 µs |
+| 512 / 512 | 720 µs | 805 µs | 730 to 1,000 µs | 27,702 µs |
+
+Without the JIT, Python adds about 20 µs to a step of about 100
+operations: each is one call into the engine. Under `TinyJit` a replay
+runs no Python and matches Mojo's `MiniJit` (21 µs for the first row).
+The largest row is kernel time and the noisiest (the second run's
+median rose with the load).
+
+```sh
+pixi run python-build
+PYTHONPATH=python pixi run python benchmarks/mlp_step.py 8 32 3000 jit
+```
+
 ## The MNIST convolutional network: one training step
 
 tinygrad's `beautiful_mnist` model (four convolutions, two batch

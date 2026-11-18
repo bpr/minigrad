@@ -10,6 +10,11 @@ version = "0.1.0"
 test = "bash tests/run_all.sh"
 format = "mojo format minigrad tests examples benchmarks"
 package = "mkdir -p build && mojo precompile minigrad -o build/minigrad.mojoc"
+# The Python bindings' engine, python/minigrad/_ext.so; then
+# `PYTHONPATH=python python ...` imports minigrad.
+python-build = "mojo build -I . --emit shared-lib -o python/minigrad/_ext.so python/minigrad/_ext.mojo"
+python-test = { cmd = "python -m unittest discover -s python/tests", env = { PYTHONPATH = "python" }, depends-on = ["python-build"] }
 
 [dependencies]
 mojo = ">=1.3.0.dev0,<2"
+numpy = ">=2.5.5,<3"

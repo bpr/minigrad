@@ -41,6 +41,22 @@ def test_pure_function() raises:
         assert_close(got[1], want[1].tolist())
 
 
+def f_view_out(xs: List[Tensor]) raises -> List[Tensor]:
+    return [(xs[0] * 2.0).contiguous().reshape(4, 3).T()]
+
+
+def test_views_as_inputs_and_outputs() raises:
+    # Inputs that are views (copied into buffers of their own) and an
+    # output that is one: a replay reads the new inputs, and the copies
+    # stay alive.
+    var jit = MiniJit()
+    for call in range(5):
+        var a = Tensor.from_list(_data(12, call), [12]).reshape(3, 4)
+        var got = jit(f_view_out, [a])
+        var want = f_view_out([Tensor.from_list(_data(12, call), [3, 4])])
+        assert_close(got[0], want[0].tolist())
+
+
 def test_shape_change_raises() raises:
     var jit = MiniJit()
     var a = Tensor.ones(3, 4)

@@ -33,6 +33,8 @@ pixi run test                # every tests/test_*.mojo
 pixi run test tests/test_view.mojo   # one file
 pixi run format              # mojo format
 pixi run package             # build/minigrad.mojoc
+pixi run python-build        # python/minigrad/_ext.so, the Python bindings' engine
+pixi run python-test         # python/tests (unittest, against NumPy)
 ```
 
 Run a program against the source tree with `-I .`:
@@ -49,8 +51,10 @@ Tests import `tests/helpers.mojo`, so they need `-I tests` as well
 
 ## Tech stack
 
-- Mojo 1.3 (nightly), managed with pixi. No other dependencies: no MAX,
-  no Python, no C compiler at run time.
+- Mojo 1.3 (nightly), managed with pixi. The engine has no other
+  dependencies: no MAX, no Python, no C compiler at run time. The
+  Python bindings use the pixi environment's Python and NumPy (NumPy is
+  optional for the package itself).
 - Stdlib sources: `~/src/mojo/repos/modular/Mojo/stdlib/std`
 - Language docs and changelog: `~/src/mojo/repos/modular/Mojo/docs`
   (`docs/site/reference/cheat-sheets/` is the fastest way in; check
@@ -78,6 +82,8 @@ Tests import `tests/helpers.mojo`, so they need `-I tests` as well
 | `minigrad/linalg.mojo` | Eager dense linear algebra: `solve`, `det`, `inv`, `cholesky`, `eigh` (copied from MojoDEC) |
 | `minigrad/json.mojo`, `minigrad/safetensors.mojo` | A minimal JSON reader; reading safetensors weights |
 | `minigrad/llm/` | `bpe.mojo` (GPT-2's tokenizer), `gpt2.mojo` (the model, with a key-value cache per slot), `batching.mojo` (`Batcher`: continuous batching) |
+| `python/minigrad/` | The Python package: `_ext.mojo` (the extension module: handles and dispatch by name), `tensor.py` (tinygrad's `Tensor` API), `jit.py` (`TinyJit` over `MiniJit`), `nn/` (layers, optimizers, `state`, `datasets`). `docs/python.md` |
+| `python/tests/` | The Python package against NumPy |
 | `tests/` | One `test_*.mojo` per area; `helpers.mojo` has `assert_close` |
 | `examples/` | `mnist.mojo`, `gpt2.mojo` (need `examples/get_mnist.sh`, `examples/get_gpt2.sh` first) |
 | `benchmarks/` | Mojo programs and their tinygrad counterparts in `benchmarks/tinygrad/` |
@@ -185,6 +191,21 @@ Design points that span several files:
   records state during a capture (`jit_state()`), copied back after each
   replay. Anything new that touches memory outside a kernel must record
   itself, or replays silently skip it.
+- **A pad cannot sit over an op that turns zeros into nonzeros**
+  (`exp`, `log`, reciprocal, division, modulo, `pow`, equality):
+  pads move down to the loads, where masked elements read 0, so
+  `pad(exp(x))` would read `exp(0)`. `_emit` forces such an op to be a
+  root (`_breaks_zeros`), and the pad applies to its buffer. A new
+  elementwise op with `f(0) != 0` must be added there.
+- **A contraction operand stays a cast only if `gemm` converts it**
+  (float16, bfloat16 or int8 into float32, one operand); any other cast
+  (uint8 images, say) is materialized first, or the product falls to
+  the block executor at a tenth of the speed.
+- **Python bindings are two layers**: `_ext.mojo` converts and
+  dispatches, the Python package does the API. Anything a tensor
+  method needs that the engine lacks goes in Python when it composes
+  from existing operations, in Mojo (plus one `_ext` line) when not.
+  Rebuild `_ext.so` after any change to the engine.
 - **Threads come from one pool** (`runtime/pool.mojo`), used by `gemm`,
   batched products, and block kernels of 32K loop elements or more. Jobs
   are split into several chunks per thread where that costs nothing, so

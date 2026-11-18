@@ -34,15 +34,22 @@ from minigrad.graph import (
     is_movement,
     OP_BUFFER,
     OP_CAST,
+    OP_CMPEQ,
     OP_CONST,
     OP_CONTIGUOUS,
     OP_CONV,
     OP_DETACH,
+    OP_DIV,
+    OP_EXP,
     OP_EXPAND,
     OP_FLIP,
+    OP_LOG,
+    OP_MOD,
     OP_MUL,
     OP_PAD,
     OP_PERMUTE,
+    OP_POW,
+    OP_RECIP,
     OP_REDUCE,
     OP_RESHAPE,
     OP_SHRINK,
@@ -73,6 +80,20 @@ comptime _MULTI = -2
 """Owner mark: read by more than one kernel."""
 
 
+def _breaks_zeros(op: Int) -> Bool:
+    """Whether elementwise `op` can be nonzero (or trap) when its inputs
+    are all zero. A pad cannot be moved below such an operation."""
+    return (
+        op == OP_EXP
+        or op == OP_LOG
+        or op == OP_RECIP
+        or op == OP_DIV
+        or op == OP_MOD
+        or op == OP_POW
+        or op == OP_CMPEQ
+    )
+
+
 struct _Scheduler(Movable):
     var order: List[Int]
     """The unrealized graph below the roots, inputs first."""
@@ -83,13 +104,17 @@ struct _Scheduler(Movable):
     `chain_node[c]` first, then chain `chain_parent[c]`. Chain 0 is
     empty."""
     var chain_node: List[Int]
+    var chain_padded: List[Bool]
+    """Whether chain `c` pads: values it reads outside the original
+    bounds must be zero."""
     var chain_index: Dict[Int, Int]
     var memo: Dict[Int, Int]
     var kernels: List[Kernel]
     var keep: List[UOp]
     """Buffers created for padded constants, alive until execution."""
     var fail_node: Int
-    """The node to force as a root after a reshape failed to fuse."""
+    """The node to force as a root after a reshape failed to fuse, or an
+    operation that does not keep zeros zero was found under a pad."""
 
     def __init__(out self):
         self.order = List[Int]()
@@ -97,6 +122,7 @@ struct _Scheduler(Movable):
         self.owner = List[Int]()
         self.chain_parent = List[Int]()
         self.chain_node = List[Int]()
+        self.chain_padded = List[Bool]()
         self.chain_index = Dict[Int, Int]()
         self.memo = Dict[Int, Int]()
         self.kernels = List[Kernel]()
@@ -104,6 +130,7 @@ struct _Scheduler(Movable):
         self.fail_node = -1
         self.chain_parent.append(-1)
         self.chain_node.append(-1)
+        self.chain_padded.append(False)
 
     def group(mut self, roots: List[Int], forced: List[Int]):
         """Sorts the graph below `roots` and marks the kernel roots."""
@@ -134,17 +161,25 @@ struct _Scheduler(Movable):
                 continue
             if not self._is_contraction(node, m):
                 continue
+            var converted = False
             for j in range(2):
                 var s = g[].nodes[m].s0 if j == 0 else g[].nodes[m].s1
                 while is_movement(g[].nodes[s].op):
                     s = g[].nodes[s].s0
-                if g[].nodes[s].op == OP_CAST:
-                    # A buffer stored in another type (bfloat16 weights,
-                    # say) stays as it is: gemm converts as it reads.
+                if g[].nodes[s].op == OP_CAST and not converted:
+                    # A buffer stored in a type gemm converts as it reads
+                    # (bfloat16 weights, say) stays as it is; one operand
+                    # at most (`_contraction_conversion` in the planner).
                     var t = g[].nodes[s].s0
                     while is_movement(g[].nodes[t].op):
                         t = g[].nodes[t].s0
-                    if g[].nodes[t].op == OP_BUFFER:
+                    var stored = g[].nodes[t].dtype
+                    if (
+                        g[].nodes[t].op == OP_BUFFER
+                        and g[].nodes[s].dtype == DT.float32
+                        and (stored.is_half() or stored == DT.int8)
+                    ):
+                        converted = True
                         continue
                 var sop = g[].nodes[s].op
                 if sop != OP_BUFFER and sop != OP_CONST:
@@ -239,6 +274,9 @@ struct _Scheduler(Movable):
             return found.value()
         self.chain_parent.append(parent)
         self.chain_node.append(node)
+        self.chain_padded.append(
+            self.chain_padded[parent] or graph()[].nodes[node].op == OP_PAD
+        )
         var c = len(self.chain_node) - 1
         self.chain_index[key] = c
         return c
@@ -353,6 +391,12 @@ struct _Scheduler(Movable):
         ):
             idx = self._emit(k, g[].nodes[node].s0, chain, False)
         else:
+            if self.chain_padded[chain] and _breaks_zeros(op):
+                # A pad moved onto the loads leaves zeros where it pads;
+                # `exp(0)` is not zero, so the padded value must be
+                # computed first and padded as a buffer.
+                self.fail_node = node
+                return -1
             var s0 = g[].nodes[node].s0
             var s1 = g[].nodes[node].s1
             var s2 = g[].nodes[node].s2
@@ -377,7 +421,8 @@ struct _Scheduler(Movable):
 
     def build(mut self) -> Bool:
         """Builds a kernel for every root. Returns False, with
-        `fail_node` set, if a reshape did not fuse."""
+        `fail_node` set, if a reshape did not fuse or a pad lies over an
+        operation that does not keep zeros zero."""
         var g = graph()
         for i in range(len(self.order)):
             if not self.is_root[i]:
