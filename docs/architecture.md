@@ -144,6 +144,12 @@ mark through); and both operands of a contraction, so that the kernel is
 exactly two loads and a multiply. An operand that is a cast of a buffer
 stays unmaterialized when `gemm` can convert it as it reads (16-bit
 floats or int8 into float32, one operand); any other cast is a root.
+Such a root is the size of the images, not of their windows: the cast
+builder converts before any movement that keeps every element
+(`UOp.cast`), so `cast(expand(window(x)))` is built as
+`expand(window(cast(x)))`. Before this, the uint8 images of
+`beautiful_mnist.py` became a 59-million-element buffer per step, 32
+copies of each window.
 
 A kernel is built by walking down from its root. Elementwise nodes
 become instructions. Movement nodes are pushed on a chain; at a buffer

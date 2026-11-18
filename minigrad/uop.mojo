@@ -476,6 +476,15 @@ struct UOp(Equatable, ImplicitlyCopyable):
             if not dt.is_float() and self.dtype().is_float():
                 v = trunc(v)
             return UOp.const(dt, v, self.shape())
+        # Convert before a movement that does not drop elements: if the
+        # cast is materialized (a contraction operand gemm cannot
+        # convert), it is then the size of its source, not of a window
+        # or a broadcast. Zeros a pad adds convert to zero either way.
+        var op = self.op()
+        if is_movement(op) and op != OP_SHRINK:
+            return UOp._make1(
+                op, dt, self.shape(), self.arg(), self.src(0).cast(dt)
+            )
         return UOp._make1(OP_CAST, dt, self.shape(), List[Int](), self)
 
     def alu1(self, op: Int) raises -> UOp:

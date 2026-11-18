@@ -242,9 +242,16 @@ runs no Python and matches Mojo's `MiniJit` (21 µs for the first row).
 The largest row is kernel time and the noisiest (the second run's
 median rose with the load).
 
+`examples/beautiful_mnist.py` (batches of 512, `TinyJit`) takes about
+116 ms per training step against 107 ms for `examples/mnist.mojo`, run
+back to back at a load average of 4 (not a quiet machine). The Python
+step gathers uint8 images and converts them in the graph; the Mojo
+example builds float batches on the host.
+
 ```sh
 pixi run python-build
 PYTHONPATH=python pixi run python benchmarks/mlp_step.py 8 32 3000 jit
+STEPS=9 PYTHONPATH=python pixi run python examples/beautiful_mnist.py
 ```
 
 ## The MNIST convolutional network: one training step

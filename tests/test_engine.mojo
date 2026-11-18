@@ -6,7 +6,7 @@ from std.math import exp
 from std.testing import TestSuite, assert_equal, assert_true, assert_false
 
 from minigrad.dtype import DT
-from minigrad.graph import graph
+from minigrad.graph import graph, OP_CAST, OP_EXPAND
 from minigrad.runtime.kernel import runtime
 from minigrad.tensor import Tensor
 from helpers import assert_close, assert_shape
@@ -313,6 +313,21 @@ def test_unconverted_operand() raises:
         var before = graph()[].stats.gemm_kernels
         assert_close(xq.float() @ wq.float(), want, 1e-3)
         assert_true(graph()[].stats.gemm_kernels == before + 1)
+
+
+def test_cast_below_movements() raises:
+    """A cast converts before a broadcast or window, so a materialized
+    cast operand (uint8 images into a convolution) is the size of the
+    images, not of their windows times the output channels."""
+    var x = (_seq([2, 1, 9, 9]) * 3.0).round().abs().cast(DT.uint8).realize()
+    var e = x.expand(2, 4, 9, 9).cast(DT.float32)
+    assert_equal(e.uop().op(), OP_EXPAND)
+    assert_equal(e.uop().src(0).op(), OP_CAST)
+    var w = _seq([3, 1, 3, 3])
+    var want = x.float().contiguous().conv2d(w).tolist()
+    var before = graph()[].stats.gemm_kernels
+    assert_close(x.conv2d(w), want, 1e-3)
+    assert_true(graph()[].stats.gemm_kernels == before + 1)
 
 
 def test_schedule_cache() raises:

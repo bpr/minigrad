@@ -200,7 +200,9 @@ Design points that span several files:
 - **A contraction operand stays a cast only if `gemm` converts it**
   (float16, bfloat16 or int8 into float32, one operand); any other cast
   (uint8 images, say) is materialized first, or the product falls to
-  the block executor at a tenth of the speed.
+  the block executor at a tenth of the speed. `UOp.cast` converts
+  below movements that keep every element (all but `SHRINK`), so that
+  buffer is the images, not their broadcast windows.
 - **Python bindings are two layers**: `_ext.mojo` converts and
   dispatches, the Python package does the API. Anything a tensor
   method needs that the engine lacks goes in Python when it composes
