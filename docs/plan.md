@@ -68,9 +68,10 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
    large model that copy would want in-place writes into state buffers
    during replay instead.
 3. **Fuse elementwise work after a reduction** (`sum * c`, `matmul +
-   bias`, `relu` of a convolution) into the reduction's kernel. For
-   `gemm` kernels: apply the tail to each tile, or run it as a second
-   pass over the output while it is in cache.
+   bias`, `relu` of a convolution) into the same pass as the reduction:
+   for `gemm`, apply the tail to each output tile as it is stored; for
+   a reduction along the vector dimension, to each block of outputs as
+   it completes. A separate in-place pass gained nothing (see Rejected).
 4. **GPU.** Mojo compiles kernels for NVIDIA and AMD ahead of time
    (`max.gpu`, and `mojo build --emit` lists `nvptx`), which fits this
    design: the block instruction set and `gemm` become GPU kernels, and
@@ -138,6 +139,18 @@ as tinygrad's `beautiful_mnist`). CPU only. Numbers are in
   are, by estimate (49 products, about 50 ns each), under 1% of a
   decode step. It would need a thread index or thread-local storage in
   the pool.
+- **Fusing a reduction's elementwise tail as an in-place second pass**
+  (tried 2026-11-17, reverted): a reduction read only by one
+  elementwise kernel of its shape and type ran into that kernel's
+  buffer, which the kernel then finished in place, saving the
+  reduction's buffer. Fusing only when nothing outside the schedule
+  could need the reduction later meant the schedule cache's key had to
+  record outside references per node. Measured on a quiet machine
+  against the unfused build: MLP steps 75.5 / 116 / 719 µs unfused, 77.4
+  / 116 / 723 fused (the small one slower from the longer key); the
+  convolutional network 10.1 / 91-94 ms, 10.6 / 86-90 fused; GPT-2
+  decode unchanged. Still two passes over the output, and the outputs
+  are mostly in cache already: nothing to gain. About 200 lines.
 - **Reference-counted node objects** (`ArcPointer[Node]` with children):
   Mojo cannot derive the destructor of a type that refers to itself
   through `ArcPointer`, and an arena of ids gives dense traversal state

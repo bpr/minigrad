@@ -428,57 +428,5 @@ def test_blocks_split_over_threads() raises:
     assert_true(rt[].kernels_split >= split + 30)
 
 
-def test_fused_tail() raises:
-    """Elementwise work after a reduction runs in place on its output,
-    unless the reduction's value may be wanted later or the work reads
-    it at another shape or type; results are the same either way."""
-    var rt = runtime()
-    var a = _seq([33, 70])
-    var w = _seq([70, 45]) * 0.5
-    var bias = _seq([45])
-    var mm = _matmul_ref(a.tolist(), w.tolist(), 33, 70, 45)
-    var bd = bias.tolist()
-    var expect = List[Float64]()
-    for i in range(33 * 45):
-        expect.append(max(mm[i] + bd[i % 45], 0.0))
-    for _ in range(2):  # the second from the schedule cache
-        var fused = rt[].kernels_fused
-        assert_close((a @ w + bias).relu(), expect, 1e-3)
-        assert_equal(rt[].kernels_fused, fused + 1)
-    var x = _seq([40, 300])
-    var sums = _reduce_ref(x.tolist(), [40, 300], [1], False)
-    var sums2 = List[Float64]()
-    for v in sums:
-        sums2.append(v * 2.0 + 1.0)
-    # Fused: a mean, and a sum's tail through a reshape.
-    var fused = rt[].kernels_fused
-    assert_close(x.sum(1) * 2.0 + 1.0, sums2, 1e-3)
-    assert_close(x.sum(1, keepdim=True).reshape(4, 10) * 2.0 + 1.0, sums2, 1e-3)
-    assert_equal(rt[].kernels_fused, fused + 2)
-    # Not fused: the sum is held, or an intermediate is; then both are
-    # still right when read afterwards.
-    var s = x.sum(1)
-    assert_close(s * 2.0 + 1.0, sums2, 1e-3)
-    assert_close(s, sums, 1e-3)
-    var h = x.sum(1) * 2.0
-    assert_close(h + 1.0, sums2, 1e-3)
-    var doubled = List[Float64]()
-    for v in sums:
-        doubled.append(v * 2.0)
-    assert_close(h, doubled, 1e-3)
-    # Not fused: another shape (softmax's `x - max`), another type.
-    var mx = _reduce_ref(x.tolist(), [40, 300], [1], True)
-    var xd = x.tolist()
-    var shifted = List[Float64]()
-    for i in range(40 * 300):
-        shifted.append(xd[i] - mx[i // 300])
-    assert_close(x - x.max(1, keepdim=True), shifted, 1e-5)
-    var ints = List[Float64]()
-    for v in sums:
-        ints.append(Float64(Int(v)))
-    assert_close(x.sum(1).int(), ints)
-    assert_equal(rt[].kernels_fused, fused + 2)
-
-
 def main() raises:
     TestSuite.discover_tests[__functions_in_module()]().run()
