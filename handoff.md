@@ -121,5 +121,10 @@ run from minigrad's own pool threads alone (the machine is otherwise
   309 kernels and 14.7 ms of kernels (int8: 6.5 ms) here, with about
   0.15 ms of host work. The README's "Where a decode step goes" table
   predates `MiniJit`: retake it on the 9800X3D.
+- `gemm` changed after that (2026-11-18): convolution B panels packed by
+  runs, weight-gradient blocks cut at A's runs, and a 4-row tile on
+  AVX2 only (the 9800X3D keeps 8). Measure `convnet_step 64`/`512` and
+  `mnist.mojo` against the commit before it on the 9800X3D and update
+  the README's convnet and MNIST tables.
 - Still to do on the 9800X3D: the quiet tables above, then delete this
   file.

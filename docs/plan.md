@@ -73,6 +73,11 @@ API (`docs/python.md`). CPU only. Numbers are in
    for `gemm`, apply the tail to each output tile as it is stored; for
    a reduction along the vector dimension, to each block of outputs as
    it completes. A separate in-place pass gained nothing (see Rejected).
+   Bound measured 2026-11-18 (i7-12700H, batch 512): the convnet's
+   tails directly after a product take 5 ms (forward bias and ReLU) to
+   13 ms (with backward masks) of 250 ms of kernels; the MLP's, 25 of
+   2,530 µs. Fusing keeps the arithmetic, so expect 1-3%: deferred
+   behind convolution packing in `gemm`.
 4. **GPU.** Mojo compiles kernels for NVIDIA and AMD ahead of time
    (`max.gpu`, and `mojo build --emit` lists `nvptx`), which fits this
    design: the block instruction set and `gemm` become GPU kernels, and
@@ -104,9 +109,13 @@ API (`docs/python.md`). CPU only. Numbers are in
 - Reduce the executor's cost per run of a loop (about 100 ns for a
   17-instruction kernel): one dispatch per instruction instead of three
   nested ones, and gather through SIMD for table loads.
-- `gemm`: check offset tables for unit runs per panel in more cases
-  (convolution packs its windows element by element), and pack with
-  SIMD.
+- `gemm` for convolutions: B panels are packed by runs and a weight
+  gradient's A is read in place (2026-11-18: the convolutional network's
+  products 153 to 137 ms per step at batch 512 on an AVX2 laptop). What
+  remains: with 32 or 64 output channels each packed B element serves
+  only that many multiply-adds, so the forward products are limited by
+  reading B; conv1's weight gradient (C's columns scattered, runs of 24)
+  still packs A element by element.
 - Windows over a padded view copy the padded input. A mask that knows
   about windows, or a `gemm` packer that pads as it packs, would avoid
   the copy.

@@ -7,6 +7,8 @@ from std.testing import TestSuite, assert_equal, assert_true, assert_false
 
 from minigrad.dtype import DT
 from minigrad.graph import graph, OP_CAST, OP_EXPAND
+from minigrad.graph import BytePtr
+from minigrad.runtime.gemm import gemm
 from minigrad.runtime.kernel import runtime
 from minigrad.tensor import Tensor
 from helpers import assert_close, assert_shape
@@ -378,6 +380,129 @@ def test_matmul_threads() raises:
     # thread.
     var at = _seq([k, n]).T()
     assert_close(at @ b, _matmul_ref(at.tolist(), b.tolist(), n, k, m), 2e-1)
+
+
+def _gemm_check(
+    ci: List[Int],
+    cj: List[Int],
+    ai: List[Int],
+    ak: List[Int],
+    bk: List[Int],
+    bj: List[Int],
+    a_size: Int,
+    b_size: Int,
+    c_size: Int,
+    threads: Int,
+) raises:
+    """`gemm` on these tables against a plain loop, with B exactly
+    `b_size` elements, so that its last windows end at its last element."""
+    var a = List[Float32](capacity=a_size)
+    for i in range(a_size):
+        a.append(Float32((i * 37) % 23) * 0.25 - 2.0)
+    var b = List[Float32](capacity=b_size)
+    for i in range(b_size):
+        b.append(Float32((i * 11) % 19) * 0.125 - 1.0)
+    var c = List[Float32](length=c_size, fill=0.0)
+    var expect = List[Float64](length=c_size, fill=0.0)
+    for i in range(len(ci)):
+        for j in range(len(cj)):
+            var sum = 0.0
+            for k in range(len(ak)):
+                sum += Float64(a[ai[i] + ak[k]]) * Float64(b[bk[k] + bj[j]])
+            expect[ci[i] + cj[j]] = sum
+    gemm[DType.float32](
+        BytePtr(unsafe_from_address=Int(c.unsafe_ptr())),
+        ci,
+        cj,
+        BytePtr(unsafe_from_address=Int(a.unsafe_ptr())),
+        ai,
+        ak,
+        BytePtr(unsafe_from_address=Int(b.unsafe_ptr())),
+        bk,
+        bj,
+        threads,
+    )
+    _ = a^
+    _ = b^
+    for i in range(c_size):
+        var d = abs(Float64(c[i]) - expect[i])
+        if d > 1e-3 * (1.0 + abs(expect[i])):
+            raise Error(t"gemm: element {i} is {c[i]}, expected {expect[i]}")
+
+
+def _arange(n: Int, step: Int) -> List[Int]:
+    var out = List[Int](capacity=n)
+    for i in range(n):
+        out.append(i * step)
+    return out^
+
+
+def test_gemm_convolution_tables() raises:
+    """A convolution's tables, as the planner builds them: B's panels are
+    runs of an image's rows (shorter than a vector, longer, and mixed,
+    packed by runs), and a weight gradient's A has runs of one image's
+    positions (too short to cut blocks at, one block, and across
+    blocks)."""
+    var n = 3
+    var cin = 2
+    for shape in [(9, 5, 5), (17, 13, 5), (24, 20, 5), (5, 3, 3)]:
+        var size = shape[0]
+        var out_size = shape[1]
+        var kernel = shape[2]
+        var image = size * size
+        var positions = out_size * out_size
+        # Positions (n, y, x) in the input and the output; window
+        # offsets (c, ky, kx) in the input.
+        var x_at = List[Int]()
+        var y_at = List[Int]()
+        for b in range(n):
+            for y in range(out_size):
+                for x in range(out_size):
+                    x_at.append(b * cin * image + y * size + x)
+                    y_at.append(b * positions + y * out_size + x)
+        var window = List[Int]()
+        for c in range(cin):
+            for ky in range(kernel):
+                for kx in range(kernel):
+                    window.append(c * image + ky * size + kx)
+        var nk = cin * kernel * kernel
+        for cout in [20, 32]:
+            for threads in [1, 4]:
+                # Forward: C[o, (n, y, x)] = sum_w W[o, w] X[(n, y, x) + w].
+                var cj = List[Int]()
+                for b in range(n):
+                    for p in range(positions):
+                        cj.append(b * cout * positions + p)
+                _gemm_check(
+                    _arange(cout, positions),
+                    cj,
+                    _arange(cout, nk),
+                    _arange(nk, 1),
+                    window,
+                    x_at,
+                    cout * nk,
+                    n * cin * image,
+                    n * cout * positions,
+                    threads,
+                )
+                # Weight gradient: C[o, w] = sum_(n, y, x) dY[n, o, y, x]
+                # X[(n, y, x) + w].
+                var ak = List[Int]()
+                for b in range(n):
+                    for p in range(positions):
+                        ak.append(b * cout * positions + p)
+                _gemm_check(
+                    _arange(cout, nk),
+                    _arange(nk, 1),
+                    _arange(cout, positions),
+                    ak,
+                    x_at,
+                    window,
+                    n * cout * positions,
+                    n * cin * image,
+                    cout * nk,
+                    threads,
+                )
 
 
 def test_batched_matmul() raises:

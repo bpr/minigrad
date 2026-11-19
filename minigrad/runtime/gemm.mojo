@@ -26,14 +26,22 @@ arithmetic.
 from std.os import getenv
 from std.memory import unsafe_memset_zero
 from std.memory.alloc import unsafe_alloc
-from std.sys import num_physical_cores, simd_width_of, size_of
+from std.sys import (
+    num_physical_cores,
+    simd_byte_width,
+    simd_width_of,
+    size_of,
+)
 from std.sys.intrinsics import PrefetchOptions, prefetch
 
 from minigrad.graph import BytePtr
 from minigrad.runtime.pool import run_parallel
 
-comptime MR = 8
-"""Rows of C per microkernel tile."""
+comptime MR = 8 if simd_byte_width() >= 64 else 4
+"""Rows of C per microkernel tile. The tile's `MR * NV` accumulators, the
+`NV` vectors of B, and A's broadcast must fit in the vector registers:
+32 with AVX-512, 16 with AVX2, where an 8-row tile spills and runs at
+60% of the speed of a 4-row one."""
 comptime NV = 2
 """SIMD vectors of C columns per microkernel tile."""
 comptime KC = 256
@@ -166,6 +174,144 @@ def _is_unit(offsets: _IntPtr, n: Int) -> Bool:
     return True
 
 
+comptime MIN_RUN = 16
+"""Shortest run of consecutive terms of A that a block of terms is cut
+to, so that A is read in place rather than packed."""
+
+comptime LONG_RUN = 64
+"""Runs of terms of A at least this long are always cut at; shorter ones
+only when C's columns are consecutive. A cut adds an update of C per
+tile: a few vector loads and stores, or, when C's columns are scattered
+(a weight gradient laid out by output channel), one per element, which
+costs more than packing A."""
+
+
+@always_inline
+def _run_length(offsets: _IntPtr, n: Int) -> Int:
+    """How many of the first `n` offsets are consecutive."""
+    var i = 1
+    while (
+        i < n and offsets[unsafe_offset=i] == offsets[unsafe_offset=i - 1] + 1
+    ):
+        i += 1
+    return i
+
+
+def _block_terms(ak: _IntPtr, kp: Int, nk: Int, c_unit: Bool) -> Int:
+    """How many terms, from term `kp`, the next block of `_block` takes:
+    `KC`, or fewer to end where a run of consecutive terms of A ends, so
+    that A is read in place (a weight gradient's terms run over one
+    image's positions)."""
+    var kc = min(KC, nk - kp)
+    var run = _run_length(ak.unsafe_offset(kp), kc)
+    if run == kc or run < MIN_RUN:
+        return kc
+    # Inside a run a block already split, the run is longer than KC.
+    var long = run >= LONG_RUN or (
+        kp > 0 and ak[unsafe_offset=kp] == ak[unsafe_offset=kp - 1] + 1
+    )
+    return run if long or c_unit else kc
+
+
+def _reads_a_in_place(ak: _IntPtr, nk: Int) -> Bool:
+    """Whether every block `_block` takes has consecutive terms in A, for
+    any layout of C: then it never packs A."""
+    var kp = 0
+    while kp < nk:
+        var kc = _block_terms(ak, kp, nk, False)
+        if not _is_unit(ak.unsafe_offset(kp), kc):
+            return False
+        kp += kc
+    return True
+
+
+def _max(offsets: _IntPtr, n: Int) -> Int:
+    """The largest of the `n` offsets."""
+    var m = offsets[unsafe_offset=0]
+    for i in range(1, n):
+        m = max(m, offsets[unsafe_offset=i])
+    return m
+
+
+@always_inline
+def _pack_runs[
+    dt: DType, bdt: DType, NR: Int
+](
+    dst: Pointer[Scalar[dt], MutUntrackedOrigin],
+    b: Pointer[Scalar[bdt], MutUntrackedOrigin],
+    bk: _IntPtr,
+    kc: Int,
+    bj: _IntPtr,
+    nr: Int,
+    last_b: Int,
+    runs: _IntPtr,
+) -> Bool:
+    """Packs the `kc` by `nr` panel of B at rows `bk` and columns `bj`
+    into `dst` (`NR` elements per row) by runs of consecutive columns,
+    with vector loads: a convolution's window over rows of an image is a
+    few runs. Returns False, packing nothing, when the runs average under
+    two columns (a transposed B), which the caller packs element by
+    element.
+
+    A run shorter than a vector is loaded and stored as a whole vector;
+    the excess lands where later runs, later rows, or later panels are
+    stored, so `dst` must be packed in order and have a vector of slack
+    at the end. The load reads past the run only when that stays at or
+    below `last_b`, B's last element; otherwise the run is copied
+    element by element."""
+    comptime W = simd_width_of[dt]()
+    # Runs as (first column's offset, position in the panel, length).
+    var n = 0
+    var j = 0
+    while j < nr:
+        var first = bj[unsafe_offset=j]
+        var length = 1
+        while (
+            j + length < nr and bj[unsafe_offset=j + length] == first + length
+        ):
+            length += 1
+        runs[unsafe_offset=3 * n] = first
+        runs[unsafe_offset=3 * n + 1] = j
+        runs[unsafe_offset=3 * n + 2] = length
+        n += 1
+        j += length
+    if 2 * n > nr:
+        return False
+    for k in range(kc):
+        var row_offset = bk[unsafe_offset=k]
+        var row = b.unsafe_offset(row_offset)
+        var d = dst.unsafe_offset(k * NR)
+        for q in range(n):
+            var first = runs[unsafe_offset=3 * q]
+            var at = runs[unsafe_offset=3 * q + 1]
+            var length = runs[unsafe_offset=3 * q + 2]
+            var src = row.unsafe_offset(first)
+            var to = d.unsafe_offset(at)
+            if length >= W:
+                # Whole vectors, the last one overlapping the one before.
+                var t = 0
+                while t + W <= length:
+                    to.unsafe_store(
+                        t, src.unsafe_load[width=W, alignment=1](t).cast[dt]()
+                    )
+                    t += W
+                if t < length:
+                    to.unsafe_store(
+                        length - W,
+                        src.unsafe_load[width=W, alignment=1](length - W).cast[
+                            dt
+                        ](),
+                    )
+            elif row_offset + first + W - 1 <= last_b:
+                to.unsafe_store(
+                    0, src.unsafe_load[width=W, alignment=1](0).cast[dt]()
+                )
+            else:
+                for t in range(length):
+                    to[unsafe_offset=t] = src[unsafe_offset=t].cast[dt]()
+    return True
+
+
 @fieldwise_init
 struct _Job(Copyable):
     """One thread's share of a `gemm`: rows `[i_lo, i_hi)` and columns
@@ -189,8 +335,9 @@ struct _Job(Copyable):
 
 
 comptime DOT_COLS = 3
-"""Columns of B per tile of `_block_dots`: with `MR` rows, 24
-accumulators, which leaves registers for the operands."""
+"""Columns of B per tile of `_block_dots`: `MR * DOT_COLS` accumulators
+(24 with AVX-512, 12 with AVX2), which leaves registers for the
+operands."""
 
 
 @always_inline
@@ -327,13 +474,26 @@ def _block[dt: DType, bdt: DType](job: _Job):
     var direct = (ni + MR - 1) // MR <= DIRECT_PANELS and _is_unit(
         _IntPtr(unsafe_from_address=job.ak), nk
     )
+    # A panel of B that is not one run of consecutive columns is packed
+    # run by run (`_pack_runs`); a short run's vector load may read past
+    # it, but never past B's last element, `last_b`.
+    var last_b = _max(_IntPtr(unsafe_from_address=job.bk), nk) + _max(
+        bj.unsafe_offset(job.j_lo), job.j_hi - job.j_lo
+    )
+    var runs = unsafe_alloc[Int](3 * NR, alignment=64)
+    var c_unit = _is_unit(cj.unsafe_offset(job.j_lo), job.j_hi - job.j_lo)
     var jc = job.j_lo
     while jc < job.j_hi:
         var nc = min(NC, job.j_hi - jc)
         var jpanels = (nc + NR - 1) // NR
         var kp = 0
         while kp < nk:
-            var kc = min(KC, nk - kp)
+            var kc = _block_terms(
+                _IntPtr(unsafe_from_address=job.ak),
+                kp,
+                nk,
+                c_unit,
+            )
             var ak = _IntPtr(unsafe_from_address=job.ak).unsafe_offset(kp)
             var bk = _IntPtr(unsafe_from_address=job.bk).unsafe_offset(kp)
             # Pack B[kp:kp+kc, jc:jc+nc] into panels of NR columns, kc by
@@ -360,6 +520,10 @@ def _block[dt: DType, bdt: DType](job: _Job):
                 else:
                     if nr < NR:
                         unsafe_memset_zero(dst, kc * NR)
+                    if _pack_runs[dt, bdt, NR](
+                        dst, b, bk, kc, bj.unsafe_offset(j0), nr, last_b, runs
+                    ):
+                        continue
                     for k in range(kc):
                         var row = b.unsafe_offset(bk[unsafe_offset=k])
                         var d = dst.unsafe_offset(k * NR)
@@ -498,6 +662,7 @@ def _block[dt: DType, bdt: DType](job: _Job):
     tile.unsafe_free()
     zeros.unsafe_free()
     edge.unsafe_free()
+    runs.unsafe_free()
 
 
 def _block_task[dt: DType, bdt: DType](ctx: Int, i: Int):
@@ -778,9 +943,9 @@ def gemm[
     # `threads == 1` means this call is itself a pool task: run_parallel
     # is not reentrant, so it must stay one chunk.
     if threads > 1 and ni * nj * nk >= PARALLEL_WORK:
-        # Every column chunk packs all of A when A's terms are not
-        # consecutive: then one chunk per thread.
-        var chunks = CHUNKS_PER_THREAD if _is_unit(
+        # Every column chunk packs all of A when it cannot read A in
+        # place: then one chunk per thread.
+        var chunks = CHUNKS_PER_THREAD if _reads_a_in_place(
             _IntPtr(unsafe_from_address=Int(ak.unsafe_ptr())), nk
         ) else 1
         if by_rows:

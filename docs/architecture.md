@@ -214,15 +214,16 @@ few rows:
 
 - up to 3 rows, the matrix-vector path streams B's rows once, with each
   row's sums in memory;
-- 4 to 16 rows (two panels of the tiled kernel), with B stored
+- 4 rows to two panels of the tiled kernel (16 rows with AVX-512, 8
+  with AVX2), with B stored
   `(in, out)`, the tiled kernel reads B in place instead of packing it.
   Packing pays for itself only when many row panels reuse a packed
   panel; here it would add a pass over B, and for int8 weights a copy
   four times their size. The in-place microkernel walks down a strip of
   B's columns, a few lines per row, which the hardware prefetcher does
   not follow from memory, so it prefetches 32 rows ahead;
-- 4 to 16 rows with B stored `(out, in)` (the output projection,
-  `x @ wte.T`), tiles of 8 rows by 3 columns of dot products,
+- as many rows with B stored `(out, in)` (the output projection,
+  `x @ wte.T`), tiles of one panel's rows by 3 columns of dot products,
   vectorized along the terms. Packing that layout went element by
   element and took 29 of a 45 ms step.
 
@@ -307,10 +308,27 @@ short vectors, where the cost per run of the loop dominates; flattening
 is the answer to that, and `gemm` is the answer where it matters most.
 
 `gemm` (`minigrad/runtime/gemm.mojo`) is a Goto/BLIS-style kernel: pack
-blocks through the offset tables, accumulate 8 by 32 tiles of the output
-in vector registers with fused multiply-adds, split the work over the
-thread pool (by columns where it can, so B is packed once). On the development machine (Ryzen 7 9800X3D, AVX-512) it runs
-at about 290 GFLOPS on one thread, close to the processor's peak.
+blocks through the offset tables, accumulate tiles of the output in
+vector registers with fused multiply-adds, split the work over the
+thread pool (by columns where it can, so B is packed once). A tile is
+two vectors wide and as tall as the registers allow: 8 rows with
+AVX-512's 32 registers, 4 with AVX2's 16 (8 rows spill there, and ran
+at 60% of the speed). On the development machine (Ryzen 7 9800X3D,
+AVX-512) it runs at about 290 GFLOPS on one thread, close to the
+processor's peak; on an AVX2 laptop (i7-12700H), at about 115 GFLOPS,
+80% of its peak.
+
+A convolution is one product with the batch folded into the columns,
+and its tables are not one run per panel, so two cases matter there.
+B's panels are windows over image rows: a few runs of consecutive
+columns, which are packed run by run with vector loads (a run shorter
+than a vector is loaded whole, the excess overwritten by the next run,
+never reading past B's last element). A weight gradient's A has terms
+in runs of one image's positions; blocks of terms are cut where those
+runs end, so A is read in place instead of packed, and every thread no
+longer packs all of A. Cutting adds an update of C per tile per block,
+so short runs (under 64 terms) are cut only when C's columns are
+consecutive.
 
 ## Inference
 

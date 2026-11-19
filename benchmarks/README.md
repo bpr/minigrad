@@ -325,6 +325,16 @@ larger share as threads are added.
 The matrix-vector path (up to 16 rows, B streamed once) reaches 54 to 62
 GB/s on GPT-2's layers, the machine's memory bandwidth.
 
+On an AVX2 laptop (i7-12700H, 6 performance and 8 efficiency cores),
+`gemm` uses tiles of 4 rows instead of 8 (8 spill its 16 vector
+registers): one thread then runs a 512 x 784 times 784 x 512 product
+at about 118 GFLOPS instead of 67, against a peak of about 144. Along
+with packing convolution operands by runs, this took the laptop's
+convolutional network step at batch 512 from 251 to 214 ms, the MLP
+512/512 step from 3.3 to 2.6 ms, and `examples/mnist.mojo` from 27.7
+to 22.6 s (interleaved runs, medians). The tables above are from before
+the packing change on the 9800X3D, whose tile is unchanged.
+
 ## Against the brief's bar
 
 `~/markdown/tinygrad-mojo.md` sets seven criteria. Where this stands:
