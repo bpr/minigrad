@@ -634,6 +634,9 @@ def make_plan(k: Kernel) -> Plan:
             )
             plan.loads.append(pl^)
 
+    if plan.reduce_op >= 0:
+        _reduced_outer_last(plan)
+
     # Block temporaries: constants and persistent loads keep theirs for
     # the whole run; the others are reused once their value is dead.
     var ni = len(k.instrs)
@@ -678,6 +681,65 @@ def make_plan(k: Kernel) -> Plan:
                     free.append(plan.slots[o])
     plan.nslots = nslots
     return plan^
+
+
+def _reduced_outer_last(mut plan: Plan):
+    """Reorders a reduction's outer dimensions so that those it keeps
+    come before those it reduces (a batch normalization's statistics,
+    `(N, C, H, W)` summed over N, H, W, loop over C first). The kept
+    ones can then be split over threads, each output's sum staying on
+    one thread. Each output reads its terms in the same order as before,
+    so the sums are unchanged to the last bit."""
+    var nouter = len(plan.sizes) - 1
+    var order = List[Int]()
+    for d in range(nouter):
+        if plan.out_strides[d] != 0:
+            order.append(d)
+    var kept = len(order)
+    if kept == 0 or kept == nouter:
+        return
+    var sorted = True
+    for i in range(kept):
+        if order[i] != i:
+            sorted = False
+    if sorted:
+        return
+    for d in range(nouter):
+        if plan.out_strides[d] == 0:
+            order.append(d)
+    order.append(nouter)  # the vector dimension stays last
+    var sizes = List[Int]()
+    var out_strides = List[Int]()
+    for d in order:
+        sizes.append(plan.sizes[d])
+        out_strides.append(plan.out_strides[d])
+    plan.sizes = sizes^
+    plan.out_strides = out_strides^
+    for l in range(len(plan.loads)):
+        ref pl = plan.loads[l]
+        var strides = List[Int]()
+        var mask = List[Int]()
+        for d in order:
+            strides.append(pl.strides[d])
+            if len(pl.mask) > 0:
+                mask.append(pl.mask[2 * d])
+                mask.append(pl.mask[2 * d + 1])
+        pl.strides = strides^
+        pl.mask = mask^
+
+
+def _kept_positions(plan: Plan) -> Int:
+    """How many outer positions the leading outer dimensions that a
+    reduction does not reduce span: chunks of these write disjoint
+    outputs. All of them for a kernel that is not a reduction."""
+    var nouter = len(plan.sizes) - 1
+    var n = 1
+    for d in range(nouter):
+        if plan.reduce_op >= 0 and plan.out_strides[d] == 0:
+            if plan.sizes[d] > 1:
+                break
+        n *= plan.sizes[d]
+    return n
 
 
 struct CachedKernel(Copyable):
@@ -1022,11 +1084,11 @@ def run_plan(
     # Chunks that write disjoint outputs: of outer positions when no
     # outer dimension is reduced, or of the vector dimension (whole
     # blocks and groups) when it is not reduced.
-    var outer_ok = True
-    if rop >= 0:
-        for d in range(nd - 1):
-            if plan.out_strides[d] == 0 and plan.sizes[d] > 1:
-                outer_ok = False
+    # A reduction over outer dimensions splits by the outer dimensions
+    # before them (`_reduced_outer_last` puts the kept ones first):
+    # chunks of `kept` positions, each `inner` outer positions long.
+    var kept = _kept_positions(plan)
+    var inner = positions // kept
     var vec_ok = rop < 0 or not plan.vec_reduced
     var group = plan.group
     var unit = BLOCK // group * group if group <= BLOCK else group
@@ -1036,13 +1098,13 @@ def run_plan(
     var by_outer = True
     if threads > 1 and positions * length >= BLOCK_PARALLEL_WORK:
         var most = CHUNKS_PER_THREAD * threads
-        if outer_ok and positions >= most:
+        if kept >= most:
             chunks = most
         elif vec_ok and units >= 2:
             by_outer = False
             chunks = min(most, units)
-        elif outer_ok:
-            chunks = positions
+        elif kept >= 2:
+            chunks = kept
     if chunks > 1:
         rt[].kernels_split += 1
     rt[].reserve(chunks * plan.nslots)
@@ -1077,7 +1139,8 @@ def run_plan(
             Int(rt[].zeros),
             by_outer,
             chunks,
-            positions,
+            kept,
+            inner,
             unit,
         )
     )
@@ -1109,8 +1172,12 @@ struct _Blocks(Copyable):
     var by_outer: Bool
     """Chunks of outer positions, or else of the vector dimension."""
     var chunks: Int
-    var positions: Int
-    """Outer positions in all."""
+    var kept: Int
+    """Outer positions that chunks split: all of them, or for a
+    reduction over outer dimensions, those of the leading dimensions it
+    keeps."""
+    var inner: Int
+    """Outer positions per kept position."""
     var unit: Int
     """Elements of the vector dimension a chunk boundary is a multiple
     of: whole blocks, and whole groups of a segmented reduction."""
@@ -1123,12 +1190,12 @@ def _blocks_task(ctx: Int, i: Int):
     var n = job[].chunks
     var length = plan[].sizes[len(plan[].sizes) - 1]
     var p_lo = 0
-    var p_hi = job[].positions
+    var p_hi = job[].kept * job[].inner
     var j_lo = 0
     var j_hi = length
     if job[].by_outer:
-        p_lo = job[].positions * i // n
-        p_hi = job[].positions * (i + 1) // n
+        p_lo = job[].kept * i // n * job[].inner
+        p_hi = job[].kept * (i + 1) // n * job[].inner
     else:
         var units = (length + job[].unit - 1) // job[].unit
         j_lo = units * i // n * job[].unit

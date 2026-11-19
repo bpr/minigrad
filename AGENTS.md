@@ -275,6 +275,10 @@ Each of these cost a debugging session.
   one), and other sessions compile in bursts. Take numbers only when
   `/proc/loadavg` is below 1, report medians over many steps, and
   distrust a single-threaded figure with a large gap to its minimum.
+  The benchmark machine is a laptop (`benchmarks/README.md`): under
+  load it boosts for about ten seconds, then a power limit cuts the
+  clock by 25-30%, so the second of two back-to-back runs looks slower.
+  Compare builds with short runs, 30 s pauses, and alternating order.
 - Integer division by zero in a SIMD loop traps the process; the integer
   division loops are scalar and exact for that reason.
 

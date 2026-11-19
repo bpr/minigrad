@@ -295,9 +295,13 @@ dimension, with its own block temporaries). Chunks never share an
 output element: they are ranges of outer positions when no outer
 dimension is reduced, or else ranges of the vector dimension in whole
 blocks and whole groups of a segmented reduction, when it is not
-reduced. Each output is then summed in the same order as on one thread,
-so results do not depend on the thread count. A kernel reduced along
-both its vector and an outer dimension stays on one thread.
+reduced. A reduction over outer dimensions (batch normalization's
+statistics: `(N, C, H, W)` summed over N, H, and W) has its kept outer
+dimensions moved ahead of the reduced ones in the plan, and is split by
+ranges of those (by channel). Each output is then summed in the same
+order as on one thread, so results do not depend on the thread count,
+and the reordering does not change them either. Only a kernel that
+reduces every outer dimension and its vector one stays on one thread.
 
 This is an interpreter with a block as its unit of work, in the manner
 of numexpr, rather than a code generator. It has no compile step (the

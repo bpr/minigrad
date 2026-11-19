@@ -86,6 +86,39 @@ def test_reduce_each_axis() raises:
     assert_close(x.max(), _reduce_ref(data, shape, [0, 1], True))
 
 
+def test_reduce_outer_axes_threads() raises:
+    """A batch normalization's reductions: (N, C, H, W) over N, H, and W,
+    past the size where block kernels are split over threads. The kept
+    dimension C goes first in the loop and is split over threads; sums
+    are the same to the last bit on one thread and on all. Through a
+    padded, flipped view too, whose masks are reordered with the
+    dimensions."""
+    var shape: List[Int] = [24, 12, 18, 20]
+    var x = _seq(shape)
+    # Padding on N, whose mask moves behind C's.
+    var p = x.pad([2, 1, 0, 0, 1, 2, 3, 0]).flip(0)
+    var pshape: List[Int] = [27, 12, 21, 23]
+    for v in [x, p]:
+        var vshape = shape.copy() if v.shape() == shape else pshape.copy()
+        var data = v.tolist()
+        var rt = runtime()
+        var all = rt[].threads
+        var all_axes: List[List[Int]] = [[0, 2, 3], [0, 3], [0, 1, 3], [2, 3]]
+        for axes in all_axes:
+            var expect = _reduce_ref(data, vshape, axes, False)
+            assert_close(v.sum(axes), expect, 1e-1)
+            assert_close(v.max(axes), _reduce_ref(data, vshape, axes, True))
+            # Scaling by powers of two is exact, and gives graphs that
+            # are not already realized.
+            rt[].threads = 1
+            var one = (v * 2.0).sum(axes).tolist()
+            rt[].threads = all
+            var many = (v * 4.0).sum(axes).tolist()
+            assert_equal(len(one), len(many))
+            for i in range(len(one)):
+                assert_equal(one[i] * 2.0, many[i])
+
+
 def test_reduce_through_views() raises:
     var shape: List[Int] = [37, 300]
     var x = _seq(shape)

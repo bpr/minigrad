@@ -59,10 +59,9 @@ API (`docs/python.md`). CPU only. Numbers are in
    - Slicing with steps and `__getitem__` with ranges; `cumsum`;
      `multinomial`.
 2. **Host work per step** is mostly gone where it matters: schedules
-   are cached by structure, and `MiniJit` replays whole steps (a small
-   MLP training step 78 to 21 µs; GPT-2 decode saves about 0.9 ms per
-   token in the one clean measurement so far, to be confirmed in quiet
-   time). Left: steps that cannot be captured (host values that change,
+   are cached by structure, and `MiniJit` replays whole steps (on the
+   benchmark laptop, a small MLP training step 150 to 70 µs; GPT-2
+   decode spends 0.2 ms of 15.3 per token on host work). Left: steps that cannot be captured (host values that change,
    shapes that change), whose graphs could still be built more cheaply
    (each node allocates its shape, argument, and hash-cons key as
    lists). Replays copy assigned state back into place every step; for a
@@ -106,6 +105,12 @@ API (`docs/python.md`). CPU only. Numbers are in
   `backward` can warn when the loss depends on one (today the gradient
   silently stops there, as in tinygrad).
 
+- The convolutional network's block kernels take 54 of about 185 ms
+  per step at batch 512 (benchmark laptop). Reductions over batch and
+  space are threaded by channel now (1.2 to 1.8 ms each, about 22 GB/s);
+  the largest left are max pooling and its gradient (`[..., 2, 2]`
+  windows, 1.2 to 3.9 ms each) and elementwise passes over
+  `(512, 32, 24, 24)` activations (2.2 to 3.5 ms).
 - Reduce the executor's cost per run of a loop (about 100 ns for a
   17-instruction kernel): one dispatch per instruction instead of three
   nested ones, and gather through SIMD for table loads.
