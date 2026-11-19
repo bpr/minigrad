@@ -248,7 +248,7 @@ struct Stats(Copyable):
     var nodes_reused: Int
     """Hash-cons hits."""
     var kernels_run: Int
-    """Kernels executed."""
+    """Kernels executed, including those a `MiniJit` replays."""
     var kernels_compiled: Int
     """Kernels lowered to an execution plan (plan cache misses)."""
     var schedules: Int
@@ -262,7 +262,8 @@ struct Stats(Copyable):
     var ns_build: Int
     """Nanoseconds spent building kernels from the graph."""
     var ns_execute: Int
-    """Nanoseconds spent running kernels (including plan lookups)."""
+    """Nanoseconds spent running kernels (including plan lookups), and
+    `MiniJit` replays (with their gathers, scatters, and copies)."""
 
     def __init__(out self):
         self.nodes_created = 0

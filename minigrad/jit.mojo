@@ -263,6 +263,7 @@ struct MiniJit(Movable):
             now[self.inputs[i]] = _buffer_of(inputs[i])
         var ins = List[BytePtr]()
         var trace = rt[].debug >= 2
+        var start = perf_counter_ns()
         for s in self.tape:
             var t0 = perf_counter_ns() if trace else 0
             ins.clear()
@@ -272,6 +273,9 @@ struct MiniJit(Movable):
             if s.kind == STEP_KERNEL:
                 if s.plan >= 0:
                     run_plan(rt[].plans[s.plan], dst, ins, s.instrs)
+                    g[].stats.kernels_run += 1
+                    if rt[].plans[s.plan].gemm:
+                        g[].stats.gemm_kernels += 1
             elif s.kind == STEP_GATHER:
                 run_gather(ins[0], ins[1], dst, s)
             elif s.kind == STEP_SCATTER:
@@ -290,6 +294,7 @@ struct MiniJit(Movable):
                     print(t"replay step{s.kind} {us} us")
         for i in range(len(self.state_before)):
             _copy_buffer(self.state_after[i], self.state_before[i])
+        g[].stats.ns_execute += Int(perf_counter_ns() - start)
         var out = List[Tensor]()
         for i in range(len(self.outputs)):
             out.append(

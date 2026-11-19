@@ -204,7 +204,7 @@ def main() raises:
         )
         var per = Float64(max(1, n - 1)) * 1e3
         print(
-            t"decode step (us): building the graph"
+            t"decode step (us): host work (graph building, sampling)"
             t" {Float64(total - st.ns_group - st.ns_build - st.ns_execute) / per},"
             t" choosing kernels {Float64(st.ns_group) / per}, building kernels"
             t" {Float64(st.ns_build) / per}, running kernels"

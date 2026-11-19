@@ -114,5 +114,12 @@ run from minigrad's own pool threads alone (the machine is otherwise
 - Python MNIST finished: 26.8 s, 97.87%, peak RSS 3.6 GB (added to the
   README as a separate-machine note).
 - Python MLP here: 181/84, 711/380, 4120/4133 µs (plain/jit).
+- The GPT-2 decode breakdown was wrong since decode moved to `MiniJit`
+  (`c412173`): replays did not count in `stats`, so "running kernels"
+  showed about 0.5 ms and 13 kernels, and replayed kernel time was
+  reported as "building the graph". Replays now count; the line reads
+  309 kernels and 14.7 ms of kernels (int8: 6.5 ms) here, with about
+  0.15 ms of host work. The README's "Where a decode step goes" table
+  predates `MiniJit`: retake it on the 9800X3D.
 - Still to do on the 9800X3D: the quiet tables above, then delete this
   file.
