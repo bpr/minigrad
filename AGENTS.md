@@ -58,9 +58,8 @@ both).
   `minigrad.linalg` uses molina's dense routines, compiled from source:
   molina is the linear algebra package in the MojoDEC repository
   (`$MOLINA_PATH`, default `../MojoDEC/molina`, linked into
-  `build/deps` by `pixi run molina`). Import only `molina.dense` and
-  `molina.real_array` from it, never `molina` itself: its sparse
-  solvers' thread pool is MAX's. The
+  `build/deps` by `pixi run molina`). molina needs no MAX (its
+  parallel loops run on its own POSIX-threads pool). The
   Python bindings use the pixi environment's Python and NumPy (NumPy is
   optional for the package itself).
 - Stdlib sources: `~/src/mojo/repos/modular/Mojo/stdlib/std`

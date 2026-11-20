@@ -3,8 +3,7 @@
 # build/deps, so code compiles with `-I build/deps`. molina lives in the
 # MojoDEC repository; MOLINA_PATH points at its package directory
 # (default: ../MojoDEC/molina, a sibling checkout). It is compiled from
-# source with this workspace's Mojo: minigrad imports only molina.dense
-# and molina.real_array, which need no MAX (the package as a whole does).
+# source with this workspace's Mojo (molina needs no MAX).
 # Run from the repository root: pixi run molina
 set -e
 MOLINA_PATH=${MOLINA_PATH:-../MojoDEC/molina}

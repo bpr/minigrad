@@ -13,8 +13,7 @@ inner loop of a model.
 
 The routines are molina's (`molina.dense`, the linear algebra package
 of the same author's MojoDEC); this module converts tensors to and from
-its `RealArray`. It imports `molina.dense` and `molina.real_array` only,
-never the `molina` package itself, whose sparse solvers need MAX.
+its `RealArray`.
 """
 
 from molina.dense import (
