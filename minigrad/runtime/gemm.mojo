@@ -671,8 +671,10 @@ def _block_task[dt: DType, bdt: DType](ctx: Int, i: Int):
     _block[dt, bdt](jobs[unsafe_offset=i])
 
 
-comptime GEMV_PARALLEL_WORK = 1_000_000
-"""Multiply-adds from which a matrix-vector product uses threads."""
+comptime GEMV_PARALLEL_BYTES = 256 * 1024
+"""Bytes of B from which a matrix-vector product uses threads: it is
+limited by reading B, which one thread does at about half the memory's
+bandwidth."""
 
 comptime GEMV_ROWS = 3
 """Rows of C up to which `gemm` streams B once instead of tiling. The
@@ -727,6 +729,39 @@ def _dot[
     return s
 
 
+comptime STRIP = 8
+"""Vectors of columns per strip of `_gemv`'s row loop, their sums held in
+registers."""
+
+
+@always_inline
+def _gemv_strip[
+    dt: DType, bdt: DType, V: Int
+](
+    arow: Pointer[Scalar[dt], MutUntrackedOrigin],
+    b: Pointer[Scalar[bdt], MutUntrackedOrigin],
+    bk: _IntPtr,
+    nk: Int,
+    crow: Pointer[Scalar[dt], MutUntrackedOrigin],
+    cj: _IntPtr,
+    j: Int,
+):
+    """Adds `sum_k arow[k] * b[bk[k] + v]` for the `V * W` consecutive
+    columns at `b` into C's row `crow`, at columns `j ..` of `cj`."""
+    comptime W = simd_width_of[dt]()
+    var acc = Array[SIMD[dt, W], V](fill=SIMD[dt, W](0))
+    for k in range(nk):
+        var s = SIMD[dt, W](arow[unsafe_offset=k])
+        var row = b.unsafe_offset(bk[unsafe_offset=k])
+        comptime for v in range(V):
+            acc[v] = s.fma(
+                row.unsafe_load[width=W, alignment=1](v * W).cast[dt](), acc[v]
+            )
+    comptime for v in range(V):
+        comptime for l in range(W):
+            crow[unsafe_offset=cj[unsafe_offset=j + v * W + l]] += acc[v][l]
+
+
 def _gemv[dt: DType, bdt: DType](job: _Job):
     """Columns `[j_lo, j_hi)` of C for a few rows, reading B once.
 
@@ -759,36 +794,31 @@ def _gemv[dt: DType, bdt: DType](job: _Job):
                 ] += _dot[dt, bdt](a.unsafe_offset(i * nk), col, nk)
         return
     if _is_unit(bj_lo, nj):
-        var acc = unsafe_alloc[Scalar[dt]](ni * nj + 2 * W, alignment=64)
-        unsafe_memset_zero(acc, ni * nj + 2 * W)
+        # Strips of columns, their sums in registers across all the
+        # terms: a running sum in memory would cost a load and a store
+        # per vector of B, four times as many per byte for int8.
         var j0 = bj_lo[unsafe_offset=0]
-        for k in range(nk):
-            var row = b.unsafe_offset(bk[unsafe_offset=k] + j0)
-            for i in range(ni):
-                var s = SIMD[dt, W](a[unsafe_offset=i * nk + k])
-                var dst = acc.unsafe_offset(i * nj)
-                var j = 0
-                while j + W <= nj:
-                    dst.unsafe_store(
-                        j,
-                        s.fma(
-                            row.unsafe_load[width=W, alignment=1](j).cast[dt](),
-                            dst.unsafe_load[width=W, alignment=1](j),
-                        ),
-                    )
-                    j += W
-                while j < nj:
-                    dst[unsafe_offset=j] += (
-                        s[0] * row[unsafe_offset=j].cast[dt]()
-                    )
-                    j += 1
         for i in range(ni):
+            var arow = a.unsafe_offset(i * nk)
             var crow = c.unsafe_offset(ci[unsafe_offset=i])
-            for j in range(nj):
-                crow[unsafe_offset=cj_lo[unsafe_offset=j]] += acc[
-                    unsafe_offset=i * nj + j
-                ]
-        acc.unsafe_free()
+            var j = 0
+            comptime for e in range(4):
+                comptime V = STRIP >> e
+                while j + V * W <= nj:
+                    _gemv_strip[dt, bdt, V](
+                        arow, b.unsafe_offset(j0 + j), bk, nk, crow, cj_lo, j
+                    )
+                    j += V * W
+            while j < nj:
+                var sum = Scalar[dt](0)
+                var col = b.unsafe_offset(j0 + j)
+                for k in range(nk):
+                    sum += (
+                        arow[unsafe_offset=k]
+                        * col[unsafe_offset=bk[unsafe_offset=k]].cast[dt]()
+                    )
+                crow[unsafe_offset=cj_lo[unsafe_offset=j]] += sum
+                j += 1
         return
     for i in range(ni):
         var crow = c.unsafe_offset(ci[unsafe_offset=i])
@@ -836,15 +866,19 @@ def _gemv_all[
         var row = pa.unsafe_offset(ai[i])
         for k in range(nk):
             apack[unsafe_offset=i * nk + k] = row[unsafe_offset=ak[k]]
+    # Column ranges in whole vectors of C and whole cache lines of B (64
+    # int8 columns), so that no two threads read the same line of B.
+    comptime UNIT = max(W, 64 // size_of[Scalar[bdt]]())
     var workers = 1
-    if threads > 1 and ni * nj * nk >= GEMV_PARALLEL_WORK:
-        workers = max(1, min(CHUNKS_PER_THREAD * threads, nj // (4 * W)))
+    if threads > 1 and nk * nj * size_of[Scalar[bdt]]() >= GEMV_PARALLEL_BYTES:
+        workers = max(
+            1, min(CHUNKS_PER_THREAD * threads, nj // max(4 * W, UNIT))
+        )
     var jobs = List[_Job](capacity=workers)
     for w in range(workers):
-        # Column ranges in whole vectors, so threads write whole lines.
-        var lo = (nj * w // workers) // W * W
+        var lo = (nj * w // workers) // UNIT * UNIT
         var hi = nj if w == workers - 1 else (
-            (nj * (w + 1) // workers) // W * W
+            (nj * (w + 1) // workers) // UNIT * UNIT
         )
         jobs.append(
             _Job(

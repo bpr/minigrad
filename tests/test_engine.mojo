@@ -225,14 +225,27 @@ def test_matmul_sizes() raises:
 
 def test_matrix_vector() raises:
     """Few rows: B streamed once, by columns or by rows, threaded past
-    a million multiply-adds."""
+    256 KB of B. By rows, columns go in strips of 8, 4, 2, and 1 vectors
+    and then one at a time: 123 and 125 columns leave every kind, on one
+    thread and split in whole cache lines of B; int8 and float16 B are
+    converted in the strips."""
     var before = graph()[].stats.gemm_kernels
     check_matmul(1, 7, 300)
     check_matmul(2, 300, 9)
     check_matmul(16, 33, 70)
     check_matmul(1, 768, 2304)
     check_matmul(3, 512, 1000)
-    assert_true(graph()[].stats.gemm_kernels >= before + 15)
+    check_matmul(1, 40, 123)
+    check_matmul(2, 600, 123)
+    check_matmul(3, 700, 125)
+    assert_true(graph()[].stats.gemm_kernels >= before + 24)
+    for dt in [DT.int8, DT.float16]:
+        for shape in [(1, 2200, 123), (3, 300, 125), (1, 768, 768)]:
+            var x = _seq([shape[0], shape[1]])
+            var w = (
+                (_seq([shape[1], shape[2]]) * 4.0).round().cast(dt).realize()
+            )
+            assert_close(x @ w, (x @ w.float().contiguous()).tolist(), 1e-3)
 
 
 def test_few_rows() raises:
