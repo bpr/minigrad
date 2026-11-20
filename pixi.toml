@@ -6,10 +6,13 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
+# molina (minigrad.linalg's dense routines) from $MOLINA_PATH (default
+# ../MojoDEC/molina), linked into build/deps; see tools/molina.sh
+molina = "bash tools/molina.sh"
 # `pixi run test [FILES]`: every tests/test_*.mojo, or the given files
-test = "bash tests/run_all.sh"
+test = { cmd = "bash tests/run_all.sh", depends-on = ["molina"] }
 format = "mojo format minigrad tests examples benchmarks"
-package = "mkdir -p build && mojo precompile minigrad -o build/minigrad.mojoc"
+package = { cmd = "mojo precompile -I build/deps minigrad -o build/minigrad.mojoc", depends-on = ["molina"] }
 # The Python bindings' engine, python/minigrad/_ext.so; then
 # `PYTHONPATH=python python ...` imports minigrad.
 python-build = "mojo build -I . --emit shared-lib -o python/minigrad/_ext.so python/minigrad/_ext.mojo"

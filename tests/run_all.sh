@@ -2,6 +2,7 @@
 # Run every minigrad test file. Run from the repository root: pixi run test
 # (or `pixi run test tests/test_view.mojo` for one file).
 # MOJO_FLAGS is passed to `mojo run` (e.g. "-D ASSERT=none").
+# molina comes from build/deps (pixi run molina, which `test` runs first).
 files=("$@")
 if [ ${#files[@]} -eq 0 ]; then
     files=(tests/test_*.mojo)
@@ -9,7 +10,7 @@ fi
 failed=()
 for f in "${files[@]}"; do
     echo "=== $f"
-    mojo run $MOJO_FLAGS -I . -I tests "$f" || failed+=("$f")
+    mojo run $MOJO_FLAGS -I . -I tests -I build/deps "$f" || failed+=("$f")
 done
 if [ ${#failed[@]} -gt 0 ]; then
     echo "FAILED: ${failed[*]}"

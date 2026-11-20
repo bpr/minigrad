@@ -55,8 +55,9 @@ Early. What works, on CPU:
 - **`minigrad.nn`**: `Linear`, `Conv2d`, `BatchNorm`, `LayerNorm`; `SGD`,
   `Adam`, `AdamW`.
 - **`minigrad.linalg`**: `solve`, `det`, `inv`, `cholesky`, `eigh` on small
-  dense matrices (eager, in float64, not differentiable), shared with
-  MojoDEC.
+  dense matrices (eager, in float64, not differentiable), from molina,
+  the linear algebra package of MojoDEC (a sibling checkout,
+  `../MojoDEC`, or `MOLINA_PATH`).
 - **MNIST**: `examples/mnist.mojo` trains tinygrad's `beautiful_mnist`
   model to 97.9% test accuracy in 70 steps.
 - **Batched generation**: `GPT2(..., batch=B)` and `generate_batch`
@@ -105,7 +106,10 @@ they do not show.
 
 ## Getting started
 
-minigrad needs [pixi](https://pixi.sh) and Linux on x86-64.
+minigrad needs [pixi](https://pixi.sh) and Linux on x86-64. `minigrad.linalg`
+(and so `pixi run test`) also needs [MojoDEC](https://github.com/bpr/MojoDEC)
+checked out beside it, for its linear algebra package molina; set
+`MOLINA_PATH` to the `molina` directory of a checkout elsewhere.
 
 ```sh
 pixi install

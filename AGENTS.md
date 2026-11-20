@@ -29,6 +29,7 @@ All tooling runs through pixi (linux-64 only):
 
 ```sh
 pixi install                 # Mojo 1.3 nightly
+pixi run molina              # link ../MojoDEC/molina into build/deps (test and package run it)
 pixi run test                # every tests/test_*.mojo
 pixi run test tests/test_view.mojo   # one file
 pixi run format              # mojo format
@@ -46,13 +47,20 @@ MINIGRAD_DEBUG=2 build/mlp   # print every kernel run (and MiniJit replay step),
 MINIGRAD_THREADS=1 build/mlp # cap the threads of every kernel
 ```
 
-Tests import `tests/helpers.mojo`, so they need `-I tests` as well
-(`tests/run_all.sh` passes it).
+Tests import `tests/helpers.mojo`, so they need `-I tests` as well, and
+`minigrad.linalg` needs `-I build/deps` (`tests/run_all.sh` passes
+both).
 
 ## Tech stack
 
 - Mojo 1.3 (nightly), managed with pixi. The engine has no other
-  dependencies: no MAX, no Python, no C compiler at run time. The
+  dependencies: no MAX, no Python, no C compiler at run time.
+  `minigrad.linalg` uses molina's dense routines, compiled from source:
+  molina is the linear algebra package in the MojoDEC repository
+  (`$MOLINA_PATH`, default `../MojoDEC/molina`, linked into
+  `build/deps` by `pixi run molina`). Import only `molina.dense` and
+  `molina.real_array` from it, never `molina` itself: its sparse
+  solvers' thread pool is MAX's. The
   Python bindings use the pixi environment's Python and NumPy (NumPy is
   optional for the package itself).
 - Stdlib sources: `~/src/mojo/repos/modular/Mojo/stdlib/std`
@@ -79,7 +87,7 @@ Tests import `tests/helpers.mojo`, so they need `-I tests` as well
 | `minigrad/datasets.mojo` | MNIST loader |
 | `minigrad/nn/__init__.mojo` (end) | `quantize_int8`: symmetric int8 with a scale per output |
 | `minigrad/jit.mojo` | `MiniJit`: capture a step function's kernels and eager operations, then replay them |
-| `minigrad/linalg.mojo` | Eager dense linear algebra: `solve`, `det`, `inv`, `cholesky`, `eigh` (copied from MojoDEC) |
+| `minigrad/linalg.mojo` | Eager dense linear algebra: `solve`, `det`, `inv`, `cholesky`, `eigh` (molina's, on tensors) |
 | `minigrad/json.mojo`, `minigrad/safetensors.mojo` | A minimal JSON reader; reading safetensors weights |
 | `minigrad/llm/` | `bpe.mojo` (GPT-2's tokenizer), `gpt2.mojo` (the model, with a key-value cache per slot), `batching.mojo` (`Batcher`: continuous batching) |
 | `python/minigrad/` | The Python package: `_ext.mojo` (the extension module: handles and dispatch by name), `tensor.py` (tinygrad's `Tensor` API), `jit.py` (`TinyJit` over `MiniJit`), `nn/` (layers, optimizers, `state`, `datasets`). `docs/python.md` |
@@ -179,11 +187,11 @@ Design points that span several files:
   step belong in tensors (Adam's `b1_t`), not constants, and shapes in
   decode change only every 64 positions (`DECODE_ROWS`).
   `MINIGRAD_SCHEDULE_CACHE=0` turns the cache off for comparison.
-- **`minigrad/linalg.mojo` is a copy of MojoDEC's
-  `mojodec/routines/dense.mojo`** (pivoted LU, Cholesky, `tred2`/`tql2`
-  `eigh`), on flat lists instead of NuMojo arrays. Fix bugs in both. The
-  user chose copying over a shared library for now and will revisit if
-  duplication spreads across projects.
+- **`minigrad/linalg.mojo` wraps molina's `molina/dense.mojo`**
+  (pivoted LU, Cholesky, `tred2`/`tql2` `eigh`): tensors go to
+  `RealArray` by `tolist`, and back by `Tensor.from_list`. It replaced a
+  copy of MojoDEC's `dense.mojo` (same bits); fixes go to molina, in
+  `../MojoDEC`.
 - **`MiniJit` replays a tape** recorded in `runtime().tape` while
   `recording` is set: kernels (from `schedule._run`), gathers, and copies
   (`_record` in `tensor.mojo`), by buffer id. Captured buffers are held
